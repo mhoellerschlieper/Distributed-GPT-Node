@@ -1,4 +1,4 @@
-# GGUF CPU Inference in Rust
+# Large Language Models with GGUF CPU with Inference in Rust
 
 Welcome! You want to run an LLM in the GGUF format locally on the CPU. This project loads GGUF v3 files, builds a small Transformer model in Rust, and performs inference. All without unsafe. Many tests are included. You can adapt it easily.
 
