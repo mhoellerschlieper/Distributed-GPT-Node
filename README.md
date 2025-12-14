@@ -1,246 +1,246 @@
-# GGUF CPU Inferenz in Rust
+# GGUF CPU Inference in Rust
 
-Willkommen! Du willst ein LLM im GGUF-Format lokal auf der CPU laufen lassen. Dieses Projekt lädt GGUF v3 Dateien, baut ein kleines Transformer‑Modell in Rust und führt Inferenz durch. Alles ohne unsafe. Viele Tests sind dabei. Du kannst es leicht anpassen.
+Welcome! You want to run an LLM in the GGUF format locally on the CPU. This project loads GGUF v3 files, builds a small Transformer model in Rust, and performs inference. All without unsafe. Many tests are included. You can adapt it easily.
 
-Hinweis: Ich schreibe in einfachem Deutsch. Kurze Sätze. So lernst du es schnell.
+Note: I write in simple German. Short sentences. This way you learn it quickly.
 
 ---
 
 ## Features
 
-- CPU‑only, kein unsafe
-- GGUF v3 Loader: F32, F16, Q4_0 (18/20 B), Q8_0 (34/36 B), Q6_K (dequant vorhanden)
-  - Q4_K und Q5_K werden geladen, aber to_f32_vec gibt noch Err (geplant)
+- CPU-only, no unsafe
+- GGUF v3 loader: F32, F16, Q4_0 (18/20 B), Q8_0 (34/36 B), Q6_K (dequant available)
+  - Q4_K and Q5_K are loaded, but to_f32_vec still returns Err (planned)
 - Tokenizer:
   - Llama (SentencePiece Unigram)
-  - GPT‑2 (Byte‑Level BPE)
+  - GPT-2 (Byte-Level BPE)
 - Transformer:
-  - KV‑Cache, GQA (Grouped‑Query Attention)
-  - RoPE (mit Basis/Scaling per ENV)
-  - SwiGLU‑MLP
-- Sampling: Temperatur, Top‑K, Top‑P
-- Viele Unit‑Tests und Golden‑Step‑Vergleich
+  - KV cache, GQA (Grouped-Query Attention)
+  - RoPE (with base/scaling via ENV)
+  - SwiGLU MLP
+- Sampling: Temperature, Top-K, Top-P
+- Many unit tests and golden-step comparison
 
 ---
 
-## Schnellstart
+## Quick start
 
-Voraussetzungen:
-- Rust stable (empfohlen: aktuelle stable)
-- Ein GGUF‑Modell (z. B. TinyLlama)
+Requirements:
+- Rust stable (recommended: latest stable)
+- A GGUF model (e.g., TinyLlama)
 
-Installieren und bauen:
-```bash
-git clone <dein-repo-url>
-cd <repo>
+Install and build:
+bash
+git clone 
+cd 
 cargo build --release
-```
 
-Starten (Linux/macOS):
-```bash
-export MODEL_PATH="/pfad/zum/model.gguf"
-export PROMPT_TPL="simple"        # optional: simple | inst | chatml | im
+
+Start (Linux/macOS):
+bash
+export MODEL_PATH=&quot;/path/to/model.gguf&quot;
+export PROMPT_TPL=&quot;simple&quot;        # optional: simple | inst | chatml | im
 cargo run --release
-```
 
-Starten (Windows PowerShell):
-```powershell
-$env:MODEL_PATH="C:\Pfad\zum\model.gguf"
-$env:PROMPT_TPL="simple"
+
+Start (Windows PowerShell):
+powershell
+$env:MODEL_PATH=&quot;C:\path\to\model.gguf&quot;
+$env:PROMPT_TPL=&quot;simple&quot;
 cargo run --release
-```
 
-Konsole zeigt:
-- Model Infos
-- Eingabezeile
-- Tippe deine Frage
-- Tippe "exit" für Ende
 
-Tipp: Starte mit kleiner Temperatur (z. B. 0.2) für klare Antworten.
+Console shows:
+- Model info
+- Input line
+- Type your question
+- Type &quot;exit&quot; to quit
+
+Tip: Start with a small temperature (e.g., 0.2) for clear answers.
 
 ---
 
-## Kurzes Beispiel
+## Short example
 
 Linux/macOS:
-```bash
-export MODEL_PATH="/models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf"
+bash
+export MODEL_PATH=&quot;/models/tinyllama-1.1b-chat-v1.0.Q8_0.gguf&quot;
 export TEMP=0.2
 export TOP_K=20
 export TOP_P=0.90
 export MAX_NEW=200
 cargo run --release
-```
+
 
 Windows PowerShell:
-```powershell
-$env:MODEL_PATH="C:\models\tinyllama-1.1b-chat-v1.0.Q8_0.gguf"
-$env:TEMP="0.2"
-$env:TOP_K="20"
-$env:TOP_P="0.90"
-$env:MAX_NEW="200"
+powershell
+$env:MODEL_PATH=&quot;C:\models\tinyllama-1.1b-chat-v1.0.Q8_0.gguf&quot;
+$env:TEMP=&quot;0.2&quot;
+$env:TOP_K=&quot;20&quot;
+$env:TOP_P=&quot;0.90&quot;
+$env:MAX_NEW=&quot;200&quot;
 cargo run --release
-```
 
-Dann eingeben:
-```
-> Was ist 2 + 2?
-```
 
----
+Then type:
 
-## Projektstruktur
+&gt; What is 2 + 2?
 
-- src/main.rs: CLI, Prompt‑Loop, Checks
-- src/gguf_loader.rs: GGUF v3 Laden, Dequant, Tokenizer‑Rohdaten
-- src/model.rs: Config, Mapping der Gewichte, Checks
-- src/layer.rs: Transformer, Attention (GQA), RoPE, SwiGLU, KV‑Cache
-- src/math.rs: Matmul, Softmax, SiLU, RMSNorm, Sampler
-- src/tokenizer.rs: Llama Unigram, GPT‑2 BPE (über tokenizers‑crate)
-- src/tests.rs: Viele Unit‑ und Integrations‑Tests, Golden‑Step
 
 ---
 
-## Wichtige Umgebungsvariablen
+## Project structure
 
-Allgemein:
-- MODEL_PATH: Pfad zur .gguf Datei
-- PROMPT_TPL: simple | inst | chatml | im (Template)
-- TEMP, TOP_K, TOP_P, MAX_NEW, SEED: Sampling‑Regeln
-- MODEL_DEBUG: 1/true → viele Debug‑Logs
-- RUST_DECODE_TEST: 1 → kleiner Tokenizer Test in main, dann Ende
-- RUST_LLAMA_CHECK: 1 → kompakter Modell‑Check, dann Ende
+- src/main.rs: CLI, prompt loop, checks
+- src/gguf_loader.rs: GGUF v3 loading, dequant, tokenizer raw data
+- src/model.rs: Config, weight mapping, checks
+- src/layer.rs: Transformer, attention (GQA), RoPE, SwiGLU, KV cache
+- src/math.rs: Matmul, softmax, SiLU, RMSNorm, sampler
+- src/tokenizer.rs: Llama Unigram, GPT-2 BPE (via tokenizers crate)
+- src/tests.rs: Many unit and integration tests, golden-step
 
-RoPE / Heads:
-- ROPE_THETA: Basis überschreiben (z. B. 10000)
-- ROPE_SCALE_APPLY: 1 → einfache Skalierung aktiv
-- FORCE_KV_HEADS: 1 → KV‑Heads aus Gewichten schätzen und erzwingen
+---
+
+## Important environment variables
+
+General:
+- MODEL_PATH: Path to the .gguf file
+- PROMPT_TPL: simple | inst | chatml | im (template)
+- TEMP, TOP_K, TOP_P, MAX_NEW, SEED: sampling parameters
+- MODEL_DEBUG: 1/true &rarr; verbose debug logs
+- RUST_DECODE_TEST: 1 &rarr; small tokenizer test in main, then exit
+- RUST_LLAMA_CHECK: 1 &rarr; compact model check, then exit
+
+RoPE / heads:
+- ROPE_THETA: override base (e.g., 10000)
+- ROPE_SCALE_APPLY: 1 &rarr; enable simple scaling
+- FORCE_KV_HEADS: 1 &rarr; estimate KV heads from weights and enforce
 
 Tokenizer (BPE):
 - BPE_ADD_PREFIX_SPACE: 0/1
 - BPE_TRIM_OFFSETS: 0/1
 
-K‑Quant Layout:
-- K6_BLOCK_BYTES: 210 oder 208 (Standard 210)
-- K6_ORDER: d-s-qh-ql (Standard) oder d-s-ql-qh
+K-quant layout:
+- K6_BLOCK_BYTES: 210 or 208 (default 210)
+- K6_ORDER: d-s-qh-ql (default) or d-s-ql-qh
 
-Golden‑Step‑Test:
-- GOLDEN_JSON: Pfad zu golden.json
-- MODEL_PATH: Pfad zum Modell (gleich zur Golden‑Datei)
+Golden-step test:
+- GOLDEN_JSON: Path to golden.json
+- MODEL_PATH: Path to the model (same as for the golden file)
 - GOLDEN_TOLERANT: 1/0
-- GOLDEN_TOP5_OVERLAP_MIN: z. B. 4
-- GOLDEN_LOGITS_EPS: z. B. 0.02 bis 0.05
-- GOLDEN_ALLOW_MISMATCH_STEPS: z. B. 0…N
+- GOLDEN_TOP5_OVERLAP_MIN: e.g., 4
+- GOLDEN_LOGITS_EPS: e.g., 0.02 to 0.05
+- GOLDEN_ALLOW_MISMATCH_STEPS: e.g., 0&hellip;N
 - GOLDEN_TOP1_IN_TOP5_BIDIR: 1/0
 
 ---
 
 ## Tests
 
-Alle Tests:
-```bash
+All tests:
+bash
 cargo test
-```
 
-Golden‑Step (Vergleich mit Referenz):
-```bash
-export GOLDEN_JSON="/pfad/golden.json"
-export MODEL_PATH="/pfad/model.gguf"
+
+Golden-step (comparison with reference):
+bash
+export GOLDEN_JSON=&quot;/path/golden.json&quot;
+export MODEL_PATH=&quot;/path/model.gguf&quot;
 export GOLDEN_TOLERANT=1
 export GOLDEN_TOP5_OVERLAP_MIN=4
 export GOLDEN_LOGITS_EPS=0.02
 cargo test -- tests::golden_step_tests::test_golden_step_top1_top5_parity --nocapture
-```
 
-Hinweise:
-- Top‑1 muss gleich sein. Mit Toleranz kannst du “ähnlich” erlauben.
-- Top‑5 kann als Menge geprüft werden (z. B. 4/5 Überschneidung).
-- Logits werden zentriert (minus max) verglichen.
 
----
-
-## Grenzen und Status
-
-- Nur CPU. Kein CUDA.
-- Kein Batch. Ein Token pro Schritt.
-- Kein fused QKV Laden (wirft Err, wenn so im Modell).
-- Q4_K und Q5_K: Laden ok, Dequant noch TODO.
-- Tokenizer nutzt huggingface tokenizers‑crate.
+Notes:
+- Top-1 must match. With tolerance you can allow &ldquo;similar&rdquo;.
+- Top-5 can be checked as a set (e.g., 4/5 overlap).
+- Logits are compared after centering (minus max).
 
 ---
 
-## Tipps bei Fehlern
+## Limitations and status
 
-- “Kein GGUF File (Magic)”
-  - Datei ist nicht GGUF. Nutze eine .gguf Datei.
-
-- “n_heads must be divisible by n_kv_heads”
-  - KV‑Heads passen nicht. Prüfe GGUF‑Meta oder FORCE_KV_HEADS.
-
-- “Layer X hat nur Null‑Gewichte”
-  - Mapping schief gelaufen. Prüfe Tensors‑Namen oder Typen.
-
-- “to_f32_vec: … K‑Quant nicht implementiert”
-  - Modell nutzt Q4_K oder Q5_K. Wähle anderes Modell oder baue Dequant.
-
-- Tokenizer‑Fehler
-  - Prüfe tokenizer.ggml.model und tokens/merges/scores im GGUF.
+- CPU only. No CUDA.
+- No batching. One token per step.
+- No fused QKV loading (returns Err if the model uses it).
+- Q4_K and Q5_K: loading works, dequant is still TODO.
+- Tokenizer uses the Hugging Face tokenizers crate.
 
 ---
 
-## Beispiele: kleine Tools in main
+## Troubleshooting tips
 
-Tokenizer Test:
-```bash
+- &ldquo;No GGUF file (magic)&rdquo;
+  - File is not GGUF. Use a .gguf file.
+
+- &ldquo;n_heads must be divisible by n_kv_heads&rdquo;
+  - KV heads do not match. Check GGUF metadata or FORCE_KV_HEADS.
+
+- &ldquo;Layer X has only zero weights&rdquo;
+  - Mapping went wrong. Check tensor names or types.
+
+- &ldquo;to_f32_vec: &hellip; K-quant not implemented&rdquo;
+  - Model uses Q4_K or Q5_K. Choose another model or implement dequant.
+
+- Tokenizer errors
+  - Check tokenizer.ggml.model and tokens/merges/scores in the GGUF.
+
+---
+
+## Examples: small tools in main
+
+Tokenizer test:
+bash
 export RUST_DECODE_TEST=1
-export MODEL_PATH="/pfad/model.gguf"
+export MODEL_PATH=&quot;/path/model.gguf&quot;
 cargo run --release
-```
 
-Llama Check (Infos + 0..29 Tokens + kleiner Encode/Decode):
-```bash
+
+Llama check (info + 0..29 tokens + small encode/decode):
+bash
 export RUST_LLAMA_CHECK=1
 cargo run --release
-```
+
 
 ---
 
-## Roadmap (Ideen)
+## Roadmap (ideas)
 
-- Dequant für Q4_K / Q5_K
-- Fused‑QKV Pfad
-- Batch‑Inferenz
-- AVX/Parallelisierung für Matmul
-- Mehr RoPE‑Scaling‑Modi (NTK, YaRN präziser)
-- Mehr Prompt‑Vorlagen
-
----
-
-## Beiträge
-
-- PRs sind willkommen.
-- Schreibe kurz, was du änderst.
-- Bitte mit Tests.
-- Stil: sicherer Code, klare Fehlertexte.
+- Dequant for Q4_K / Q5_K
+- Fused-QKV path
+- Batch inference
+- AVX/parallelization for matmul
+- More RoPE scaling modes (NTK, more precise YaRN)
+- More prompt templates
 
 ---
 
-## Lizenz
+## Contributions
 
-- Siehe LICENSE (bitte ergänzen, z. B. MIT)
+- PRs are welcome.
+- Briefly describe what you change.
+- Please include tests.
+- Style: safe code, clear error messages.
 
 ---
 
-## Kontakt
+## License
 
-Marcus Schlieper — ExpChat.ai  
-Der KI Chat Client für den Mittelstand aus Breckerfeld im Sauerland.  
-RPA, KI Agents, KI Internet Research, KI Wissensmanagement.  
-Wir bringen KI in den Mittelstand.  
-Adresse: Epscheider Str21, 58339 Breckerfeld
+- See LICENSE (please add, e.g., MIT)
 
-- E‑Mail: mschlieper@ylook.de
-- Telefon: +49 2338 8748862
-- Mobil: +49 151 15751864
+---
 
-Viel Erfolg! Du schaffst das. Wenn etwas klemmt, melde dich gern.
+## Contact
+
+Marcus Schlieper &mdash; ExpChat.ai  
+The AI chat client for SMEs from Breckerfeld in the Sauerland.  
+RPA, AI agents, AI internet research, AI knowledge management.  
+We bring AI to SMEs.  
+Address: Epscheider Str21, 58339 Breckerfeld
+
+- Email: mschlieper@expchat.ai
+- Phone: +49 2338 8748862
+- Mobile: +49 151 15751864
+
+Good luck! You can do it. If something gets stuck, feel free to reach out.
