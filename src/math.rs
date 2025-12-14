@@ -304,3 +304,36 @@ pub fn apply_rope_partial_base(
         k[i1] = k0 * sin + k1 * cos;
     }
 }
+pub fn apply_rope_adjacent_pairs(
+    q: &mut [f32],
+    k: &mut [f32],
+    head_dim: usize,
+    rope_dim: usize,
+    pos: usize,
+    base: f32,
+) {
+    let rdim = rope_dim.min(head_dim);
+    if rdim < 2 { return; }
+
+    let pairs = rdim / 2;
+    let inv: Vec<f32> = (0..pairs)
+        .map(|i| 1.0_f32 / base.powf((2.0_f32 * i as f32) / rdim as f32))
+        .collect();
+    let ang: Vec<f32> = inv.iter().map(|w| *w * pos as f32).collect();
+
+    for i in 0..pairs {
+        let i0 = 2 * i;
+        let i1 = i0 + 1;
+        let cos = ang[i].cos();
+        let sin = ang[i].sin();
+
+        let q0 = q[i0]; let q1 = q[i1];
+        q[i0] = q0 * cos - q1 * sin;
+        q[i1] = q0 * sin + q1 * cos;
+
+        let k0 = k[i0]; let k1 = k[i1];
+        k[i0] = k0 * cos - k1 * sin;
+        k[i1] = k0 * sin + k1 * cos;
+    }
+}
+

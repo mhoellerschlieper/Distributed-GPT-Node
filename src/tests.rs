@@ -2369,7 +2369,7 @@ mod golden_step_tests {
                 return;
             }
         };*/
-        let s_model = "c:\\Entwicklung\\rust\\GPT-GGUF\\model\\vibethinker-1.5b-q8_0.gguf";
+        let s_model = r"C:\Entwicklung\rust\GPT-GGUF\model\tinyllama-1.1b-chat-v1.0.Q8_0.gguf";
 
         /*match std::env::var("MODEL_PATH") {
             Ok(v) => v,
