@@ -1,4 +1,4 @@
-# GGUF CPU Inferenz in Rust (Marcus Schlieper)
+# GGUF CPU Inferenz in Rust
 
 Willkommen! Du willst ein LLM im GGUF-Format lokal auf der CPU laufen lassen. Dieses Projekt lädt GGUF v3 Dateien, baut ein kleines Transformer‑Modell in Rust und führt Inferenz durch. Alles ohne unsafe. Viele Tests sind dabei. Du kannst es leicht anpassen.
 
