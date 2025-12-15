@@ -22,12 +22,12 @@ mod model;
 mod tokenizer;
 mod utils;
 
-use gguf_loader::{load_gguf, GgufModel, GgufValue};
+use gguf_loader::{GgufModel, GgufValue, load_gguf};
 use layer::TransformerModel;
-use math::{sample_top_k_top_p_temperature, SimpleRng};
+use math::{SimpleRng, sample_top_k_top_p_temperature};
 use model::{build_config, init_debug_from_env, map_all_weights, mean_abs};
-use tokenizer::{gguf_tokenizer_from_kv, GgufTokenizer};
-use utils::{detect_settings, ChatTpl, DetectedSettings};
+use tokenizer::{GgufTokenizer, gguf_tokenizer_from_kv};
+use utils::{ChatTpl, DetectedSettings, detect_settings};
 
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -65,6 +65,22 @@ fn env_bool(key: &str) -> bool {
 }
 
 // =============== Prompt-Helfer ===============
+// Toleranter Token-Check (wie in utils.rs)
+fn vocab_has_all_anyform(kv: &std::collections::HashMap<String, GgufValue>, need: &[&str]) -> bool {
+    let Some(GgufValue::ArrStr(tokens)) = kv.get("tokenizer.ggml.tokens") else {
+        return false;
+    };
+    let has_any = |pat: &str| {
+        let with_space = format!(" {}", pat);
+        let with_underscore = format!("\u{2581}{}", pat);
+        tokens
+            .iter()
+            .any(|t| t == pat || t == &with_space || t == &with_underscore)
+    };
+    need.iter().all(|p| has_any(p))
+}
+
+// Promptbauer für alle Templates
 fn build_prompt(tpl: ChatTpl, s_system: &str, s_user: &str) -> String {
     match tpl {
         ChatTpl::ChatMl => format!(
@@ -75,8 +91,36 @@ fn build_prompt(tpl: ChatTpl, s_system: &str, s_user: &str) -> String {
             "<|im_start|>system\n{}\n<|im_end|>\n<|im_start|>user\n{}\n<|im_end|>\n<|im_start|>assistant\n",
             s_system, s_user
         ),
-        ChatTpl::Inst => format!("[INST] <<SYS>>\n{}\n<</SYS>>\n{}\n[/INST]\n", s_system, s_user),
+        ChatTpl::Inst => format!(
+            "[INST] <<SYS>>\n{}\n<</SYS>>\n{}\n[/INST]\n",
+            s_system, s_user
+        ),
         ChatTpl::Simple => format!("System: {}\nUser: {}\nAssistant:", s_system, s_user),
+
+        // Neu:
+        ChatTpl::Llama3 => format!(
+            "<|start_header_id|>system<|end_header_id|>\n{}<|eot_id|>\n\
+             <|start_header_id|>user<|end_header_id|>\n{}<|eot_id|>\n\
+             <|start_header_id|>assistant<|end_header_id|>\n",
+            s_system, s_user
+        ),
+        ChatTpl::Gemma => format!(
+            "<start_of_turn>system\n{}\n<end_of_turn>\n\
+             <start_of_turn>user\n{}\n<end_of_turn>\n\
+             <start_of_turn>model\n",
+            s_system, s_user
+        ),
+        ChatTpl::TurnPipes => format!(
+            "<|start_of_turn|>system\n{}\n<|end_of_turn|>\n\
+             <|start_of_turn|>user\n{}\n<|end_of_turn|>\n\
+             <|start_of_turn|>assistant\n",
+            s_system, s_user
+        ),
+        ChatTpl::Alpaca => format!(
+            "### Instruction:\n{}\n\n### Input:\n{}\n\n### Response:\n",
+            s_system, s_user
+        ),
+        ChatTpl::Vicuna => format!("SYSTEM: {}\nUSER: {}\nASSISTANT:", s_system, s_user),
     }
 }
 
@@ -95,12 +139,19 @@ fn visible_token(s_src: &str) -> String {
     s_out
 }
 
-// Prüfé, ob alle benötigten Template-Tokens im Vokabular vorhanden sind
+// Prüfe, ob alle benötigten Template-Tokens im Vokabular vorhanden sind
 fn vocab_has_all(kv: &HashMap<String, GgufValue>, need: &[&str]) -> bool {
     let Some(GgufValue::ArrStr(tokens)) = kv.get("tokenizer.ggml.tokens") else {
         return false;
     };
-    need.iter().all(|t| tokens.iter().any(|x| x == *t))
+    let has_any_form = |pat: &str| {
+        let with_space = format!(" {}", pat);
+        let with_underscore = format!("\u{2581}{}", pat);
+        tokens
+            .iter()
+            .any(|t| t == pat || t == &with_space || t == &with_underscore)
+    };
+    need.iter().all(|p| has_any_form(p))
 }
 
 // =============== Optionale Tools (schnelle Checks) ===============
@@ -158,7 +209,10 @@ fn run_model_info_check() -> Result<(), String> {
         .unwrap_or(0);
 
     println!("{{");
-    println!("  \"model_path\": \"{}\",", s_model_path.replace('\\', "\\\\"));
+    println!(
+        "  \"model_path\": \"{}\",",
+        s_model_path.replace('\\', "\\\\")
+    );
     println!("  \"architecture\": \"{}\",", arch);
     println!("  \"vocab_size\": {}", vocab_size);
     println!("}}");
@@ -214,7 +268,8 @@ fn main() -> Result<(), String> {
     //    r"C:\Entwicklung\rust\GPT-GGUF\model\tinyllama-1.1b-chat-v1.0.Q8_0.gguf".to_string()
     //});
 
-    let s_model_path =r"C:\Entwicklung\rust\GPT-GGUF\model\tinyllama-1.1b-chat-v1.0.Q8_0.gguf".to_string(); // <= wird geladen
+    let s_model_path =
+        r"C:\Entwicklung\rust\GPT-GGUF\model\tinyllama-1.1b-chat-v1.0.Q8_0.gguf".to_string(); // <= wird geladen
     //let s_model_path =r"c:\Entwicklung\rust\GPT-GGUF\model\Cinder-Phi-2-V1.F16(1).gguf".to_string(); // <= wird geladen
     //let s_model_path =r"c:\Entwicklung\rust\GPT-GGUF\model\vibethinker-1.5b-q8_0.gguf".to_string(); // <= wird geladen
     ////let s_model_path =r"c:\Entwicklung\rust\GPT-GGUF\model\gemma-2-9b-it-Q4_K_M-fp16.gguf".to_string(); // <= wird NICHT geladen
@@ -238,12 +293,21 @@ fn main() -> Result<(), String> {
     }
     println!(
         "Model config: layers={} heads={} kv_heads={} hidden={} vocab={} ctx={} rope_dim={} rope_base={}",
-        cfg.n_layers, cfg.n_heads, cfg.n_kv_heads, cfg.hidden_size, cfg.vocab_size, cfg.max_seq_len, cfg.rope_dim, cfg.rope_base
+        cfg.n_layers,
+        cfg.n_heads,
+        cfg.n_kv_heads,
+        cfg.hidden_size,
+        cfg.vocab_size,
+        cfg.max_seq_len,
+        cfg.rope_dim,
+        cfg.rope_base
     );
 
     // 3) Tokenizer aufbauen
     let tok: GgufTokenizer =
         gguf_tokenizer_from_kv(&gguf.kv).map_err(|e| format!("Tokenizer-Fehler: {}", e))?;
+    //build_unigram_tokenizer(&gguf.kv).map_err(|e| format!("Tokenizer-Fehler: {}", e))?;
+    //build_bpe_tokenizer(&gguf.kv).map_err(|e| format!("Tokenizer-Fehler: {}", e))?;
 
     // 4) Modell instanziieren und Gewichte mappen
     let mut model = TransformerModel::new_empty(cfg.clone());
@@ -268,25 +332,44 @@ fn main() -> Result<(), String> {
         .map(|s| s.to_lowercase())
         .and_then(|s| match s.as_str() {
             "chatml" => Some(ChatTpl::ChatMl),
-            "im" => Some(ChatTpl::ImTags),
+            "im" | "imtags" => Some(ChatTpl::ImTags),
             "inst" => Some(ChatTpl::Inst),
             "simple" => Some(ChatTpl::Simple),
+            "llama3" => Some(ChatTpl::Llama3),
+            "gemma" => Some(ChatTpl::Gemma),
+            "turn" | "turnpipes" => Some(ChatTpl::TurnPipes),
+            "alpaca" => Some(ChatTpl::Alpaca),
+            "vicuna" => Some(ChatTpl::Vicuna),
             _ => None,
         });
 
-    let mut tpl = tpl_from_env.unwrap_or(detected_tpl);
+    // let mut tpl = tpl_from_env.unwrap_or(detected_tpl);
 
-    // Wenn Template-Spezialtokens fehlen, auf Simple zurückfallen
+    let mut tpl = detected_tpl;
+    if matches!(tpl, ChatTpl::Simple) {
+        tpl = utils::guess_template_from_model(&gguf.kv);
+    }
+
+    // Wenn Template-Spezialtokens fehlen, auf Simple zurückfallen (nur die, die echte Spezialtokens erwarten)
     let need = match tpl {
         ChatTpl::ImTags => vec!["<|im_start|>", "<|im_end|>"],
         ChatTpl::ChatMl => vec!["<|system|>", "<|user|>", "<|assistant|>"],
         ChatTpl::Inst => vec!["[INST]", "[/INST]"],
-        ChatTpl::Simple => vec![],
+        ChatTpl::Llama3 => vec!["<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>"],
+        ChatTpl::Gemma => vec!["<start_of_turn>", "<end_of_turn>"],
+        ChatTpl::TurnPipes => vec!["<|start_of_turn|>", "<|end_of_turn|>"],
+        // Alpaca/Vicuna haben keine speziellen Vokabel-Tokens
+        ChatTpl::Alpaca | ChatTpl::Vicuna | ChatTpl::Simple => vec![],
     };
-    if !need.is_empty() && !vocab_has_all(&gguf.kv, &need) {
+
+    if !need.is_empty() && !vocab_has_all_anyform(&gguf.kv, &need) {
         println!("Warnung: Template-Tokens fehlen im Vokabular. Fallback auf Simple.");
         tpl = ChatTpl::Simple;
     }
+
+    println!(
+        "Hinweis: PROMPT_TPL=simple|inst|chatml|im|llama3|gemma|turn|alpaca|vicuna (ENV) wählbar."
+    );
 
     // 6) Sampling-Parameter (ENV überschreibbar)
     let d_temperature: f32 = env_f32("TEMP", 0.8);
@@ -367,7 +450,8 @@ fn main() -> Result<(), String> {
         let mut s_out_prev = String::new();
 
         for _ in 0..i_max_new {
-            let next_id = sample_top_k_top_p_temperature(&logits, d_temperature, i_top_k, d_top_p, &mut rng);
+            let next_id =
+                sample_top_k_top_p_temperature(&logits, d_temperature, i_top_k, d_top_p, &mut rng);
             ids.push(next_id);
             gen_ids.push(next_id);
 
