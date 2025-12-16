@@ -1,3 +1,4 @@
+//  $env:MODEL_DEBUG="0";$env:ROPE_SCALE_APPLY="1";$env:FORCE_KV_HEADS="1";$env:RUST_DECODE_TEST="0";$env:RUST_LLAMA_CHECK="0";$env:PROMPT_TPL="turn"; cargo run --release
 use std::collections::HashMap;
 use crate::gguf_loader::GgufValue;
 

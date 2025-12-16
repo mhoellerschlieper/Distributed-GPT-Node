@@ -268,10 +268,9 @@ fn main() -> Result<(), String> {
     //    r"C:\Entwicklung\rust\GPT-GGUF\model\tinyllama-1.1b-chat-v1.0.Q8_0.gguf".to_string()
     //});
 
-    let s_model_path =
-        r"C:\Entwicklung\rust\GPT-GGUF\model\tinyllama-1.1b-chat-v1.0.Q8_0.gguf".to_string(); // <= wird geladen
+    //let s_model_path = r"C:\Entwicklung\rust\GPT-GGUF\model\tinyllama-1.1b-chat-v1.0.Q8_0.gguf".to_string(); // <= wird geladen
     //let s_model_path =r"c:\Entwicklung\rust\GPT-GGUF\model\Cinder-Phi-2-V1.F16(1).gguf".to_string(); // <= wird geladen
-    //let s_model_path =r"c:\Entwicklung\rust\GPT-GGUF\model\vibethinker-1.5b-q8_0.gguf".to_string(); // <= wird geladen
+    let s_model_path =r"c:\Entwicklung\rust\GPT-GGUF\model\vibethinker-1.5b-q8_0.gguf".to_string(); // <= wird geladen
     ////let s_model_path =r"c:\Entwicklung\rust\GPT-GGUF\model\gemma-2-9b-it-Q4_K_M-fp16.gguf".to_string(); // <= wird NICHT geladen
     ////let s_model_path =r"c:\Entwicklung\rust\GPT-GGUF\model\tinyllama-1.1b-chat-v1.0.Q4_K_S.gguf".to_string(); // <= wird NICHT geladen
 
@@ -363,7 +362,7 @@ fn main() -> Result<(), String> {
     };
 
     if !need.is_empty() && !vocab_has_all_anyform(&gguf.kv, &need) {
-        println!("Warnung: Template-Tokens fehlen im Vokabular. Fallback auf Simple.");
+        println!("Warnung: Template-Tokens fehlen im Vokabular von {:?}. Fallback auf Simple.", std::env::var("PROMPT_TPL"));
         tpl = ChatTpl::Simple;
     }
 
@@ -440,7 +439,7 @@ fn main() -> Result<(), String> {
         // Debug: Top-5 Logits
         let mut pairs: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
         pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        for (i, (id, logit)) in pairs.iter().take(5).enumerate() {
+        for (i, (id, logit)) in pairs.iter().take(10).enumerate() {
             let tok_str = tok.decode(&[*id], true).unwrap_or_default();
             println!("#{i} id={id} tok={:?} logit={:.4}", tok_str, logit);
         }

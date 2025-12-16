@@ -178,12 +178,12 @@ impl Attention {
         let i_head_dim = i_hidden / i_heads;
         let i_kv_out = i_kv_heads * i_head_dim;
 
-        if dbg_on() {
+        /*if dbg_on() {
             println!(
                 "Attention::new | heads={} kv_heads={} head_dim={} max_seq={} rope_dim={} rope_base={}",
                 i_heads, i_kv_heads, i_head_dim, i_max_seq, i_rope_dim, i_rope_base
             );
-        }
+        }*/
 
         Self {
             n_heads: i_heads,
@@ -222,19 +222,19 @@ impl Attention {
         } else {
             i_pos % self.max_seq_len
         };
-        if dbg_on() && i_pos != i_pos_eff {
+        /*if dbg_on() && i_pos != i_pos_eff {
             println!(
                 "Attention::forward | warn: pos={} wrapped-> {} (max_seq_len={})",
                 i_pos, i_pos_eff, self.max_seq_len
             );
-        }
+        }*/
 
         // Projektionen
         let v_q_all = self.w_q.forward(x); // [n_heads * head_dim]
         let v_k_all = self.w_k.forward(x); // [n_kv_heads * head_dim]
         let v_v_all = self.w_v.forward(x); // [n_kv_heads * head_dim]
 
-        if dbg_on() && i_pos_eff < 2 {
+        /*if dbg_on() && i_pos_eff < 2 {
             println!(
                 "dbg attn proj: pos={} mean|q|={:.6} mean|k|={:.6} mean|v|={:.6}",
                 i_pos_eff,
@@ -242,7 +242,7 @@ impl Attention {
                 mean_abs(&v_k_all),
                 mean_abs(&v_v_all)
             );
-        }
+        }*/
 
         // RoPE nur auf K (aktueller Schritt), dann in Cache
         for i_kvh in 0..self.n_kv_heads {
@@ -346,14 +346,14 @@ impl Attention {
         // Output-Projektion
         let y = self.w_o.forward(&v_out_heads);
 
-        if dbg_on() && i_pos_eff < 2 {
+        /*if dbg_on() && i_pos_eff < 2 {
             println!(
                 "dbg attn out: pos={} mean|head_out|={:.6} mean|y|={:.6}",
                 i_pos_eff,
                 mean_abs(&v_out_heads),
                 mean_abs(&y)
             );
-        }
+        }*/
 
         y
     }
@@ -388,7 +388,7 @@ impl FeedForward {
 
         let y = self.w2.forward(&v_act); // down
 
-        if dbg_on() {
+        /*if dbg_on() {
             println!(
                 "dbg ffn: mean|up|={:.6} mean|gate|={:.6} mean|act|={:.6} mean|y|={:.6}",
                 mean_abs(&v_up),
@@ -396,7 +396,7 @@ impl FeedForward {
                 mean_abs(&v_act),
                 mean_abs(&y)
             );
-        }
+        }*/
 
         y
     }
@@ -413,7 +413,7 @@ pub struct TransformerBlock {
 
 impl TransformerBlock {
     pub fn new(cfg: &ModelConfig) -> Self {
-        if dbg_on() {
+        /*if dbg_on() {
             println!(
                 "TransformerBlock::new | hidden={} heads={} kv_heads={} inter={} max_seq={} rope_dim={} rope_base={} rms_eps={} rope_scaling={:?} factor={:?}",
                 cfg.hidden_size,
@@ -427,7 +427,7 @@ impl TransformerBlock {
                 cfg.rope_scaling_type,
                 cfg.rope_scaling_factor
             );
-        }
+        }*/
 
         // hier ggf. rope_base mit Scaling anwenden
         let rope_base_eff = apply_rope_scaling_if_enabled(
@@ -458,14 +458,14 @@ impl TransformerBlock {
 
     pub fn forward(&mut self, x: &[f32], i_pos: usize) -> Vec<f32> {
         let a = self.ln1.forward(x);
-        if dbg_on() && i_pos < 2 {
+        /*if dbg_on() && i_pos < 2 {
             println!("dbg ln1: pos={} mean|a|={:.6}", i_pos, mean_abs(&a));
-        }
+        }*/
 
         let a2 = self.attn.forward(&a, i_pos);
-        if dbg_on() && i_pos < 2 {
+        /*if dbg_on() && i_pos < 2 {
             println!("dbg attn: pos={} mean|a2|={:.6}", i_pos, mean_abs(&a2));
-        }
+        }*/
 
         let mut h = vec![0f32; x.len()];
         for i in 0..x.len() {
@@ -474,9 +474,9 @@ impl TransformerBlock {
 
         let m = self.ln2.forward(&h);
         let m2 = self.ffn.forward(&m);
-        if dbg_on() && i_pos < 2 {
+        /*if dbg_on() && i_pos < 2 {
             println!("dbg ffn: pos={} mean|m2|={:.6}", i_pos, mean_abs(&m2));
-        }
+        }*/
 
         let mut y = vec![0f32; h.len()];
         for i in 0..h.len() {
@@ -499,7 +499,7 @@ pub struct TransformerModel {
 
 impl TransformerModel {
     pub fn new_empty(cfg: ModelConfig) -> Self {
-        if dbg_on() {
+        /*if dbg_on() {
             println!(
                 "TransformerModel::new_empty | vocab={} hidden={} layers={} heads={} kv_heads={} inter={} ctx={} rope_dim={} rope_base={} rms_eps={} rope_scaling={:?} factor={:?}",
                 cfg.vocab_size,
@@ -515,7 +515,7 @@ impl TransformerModel {
                 cfg.rope_scaling_type,
                 cfg.rope_scaling_factor
             );
-        }
+        }*/
 
         Self {
             tok_emb: vec![0.0; cfg.vocab_size * cfg.hidden_size],
@@ -549,33 +549,34 @@ impl TransformerModel {
             x[i] = row[i];
         }
 
-        if dbg_on() && i_pos < 2 {
+        /*if dbg_on() && i_pos < 2 {
             println!(
                 "dbg emb: pos={} tok_id={} mean|emb|={:.6}",
                 i_pos,
                 i_token_id,
                 mean_abs(&x)
             );
-        }
+        }*/
 
         // durch die Blöcke
         for (i_b, blk) in self.blocks.iter_mut().enumerate() {
             x = blk.forward(&x, i_pos);
 
-            if dbg_on() && i_pos == 0 && i_b == 0 {
+
+            /*if dbg_on() && i_pos == 0 && i_b == 0 {
                 println!(
                     "dbg block0 out: mean|x|={:.6} (nach attn+ffn)",
                     mean_abs(&x)
                 );
-            }
+            }*/
         }
 
         // finale Norm
         x = self.final_norm.forward(&x);
 
-        if dbg_on() && i_pos < 2 {
+        /*if dbg_on() && i_pos < 2 {
             println!("dbg final norm: pos={} mean|x|={:.6}", i_pos, mean_abs(&x));
-        }
+        }*/
 
         // LM-Head
         let mut logits = vec![0f32; self.cfg.vocab_size];
@@ -588,7 +589,7 @@ impl TransformerModel {
             &mut logits,
         );
 
-        if dbg_on() && i_pos < 2 {
+        /*if dbg_on() && i_pos < 2 {
             // Mini-Statistik statt Top-N hier (Top-N gern im Aufrufer)
             let mut max_abs = 0.0f32;
             for &v in &logits {
@@ -603,7 +604,7 @@ impl TransformerModel {
                 mean_abs(&logits),
                 max_abs
             );
-        }
+        }*/
 
         Ok(logits)
     }
