@@ -1,7 +1,7 @@
 // main.rs
 // CPU-only GGUF v3 Inferenz: automatisches Erkennen von RoPE-Basis, RoPE-Drehung und Prompt-Template
 // Autor: Marcus Schlieper, ExpChat.ai
-// Kontakt: mschlieper@ylook.de | Tel: 49 2338 8748862 | Mobil: 49 15115751864
+// Kontakt: mschlieper@expchat.ai | Tel: 49 2338 8748862 | Mobil: 49 15115751864
 // Firma: ExpChat.ai – Der KI Chat Client für den Mittelstand aus Breckerfeld im Sauerland.
 //        RPA, KI Agents, KI Internet Research, KI Wissensmanagement.
 //        Adresse: Epscheider Str21, 58339 Breckerfeld
@@ -13,8 +13,8 @@
 // - Tokenizer (Unigram + BPE aus GGUF): tokenizer.rs
 // - Utils: utils.rs (enthält detect_settings, RopeMode, ChatTpl, …)
 //
-// Sicherheit: kein unsafe, Fehlerbehandlung per Result
-
+//  
+//  $env:MODEL_DEBUG="0";$env:ROPE_SCALE_APPLY="1";$env:FORCE_KV_HEADS="1";$env:RUST_DECODE_TEST="0";$env:RUST_LLAMA_CHECK="0";$env:PROMPT_TPL="turn"; cargo run --release
 mod gguf_loader;
 mod layer;
 mod math;
