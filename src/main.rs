@@ -15,6 +15,7 @@
 //
 //  
 //  $env:MODEL_DEBUG="0";$env:ROPE_SCALE_APPLY="1";$env:FORCE_KV_HEADS="1";$env:RUST_DECODE_TEST="0";$env:RUST_LLAMA_CHECK="0";$env:PROMPT_TPL="turn"; cargo run --release
+
 mod gguf_loader;
 mod layer;
 mod math;
@@ -218,8 +219,8 @@ fn run_model_info_check() -> Result<(), String> {
     println!("}}");
 
     println!("\n== Tokens (0..29) ==");
-    for tid in 0..30usize {
-        let piece = _tok.decode(&[tid], true).unwrap_or_default();
+    for tid in 0..900usize {
+        let piece = _tok.decode(&[tid], false).unwrap_or_default();
         let shown = escape_token_piece(&piece);
         println!("{:>6} | {}", tid, shown);
     }

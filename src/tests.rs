@@ -4,6 +4,7 @@
 // Hinweis: Stelle sicher, dass in src/main.rs steht:
 //   #[cfg(test)]
 //   mod tests;
+// Start: $env:MODEL_PATH="c:\Entwicklung\rust\GPT-GGUF\model\vibethinker-1.5b-q8_0.gguf"; $env:GOLDEN_JSON="c:\Entwicklung\rust\GPT-GGUF\src\golden.json";$env:BPE_ADD_PREFIX_SPACE="0"; cargo test --tests golden_step_tests -- --nocapture
 
 #[cfg(test)]
 

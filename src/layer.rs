@@ -12,9 +12,16 @@
 //
 // Historie:
 // - 2025-12-07: Erste vollständige, robuste Version mit GQA, RoPE, SwiGLU und Debug-Schalter.
+// - 2025-12-17: RoPE-Modus per ENV schaltbar (ROPE_MODE=adj|partial), Standard: adjacent.
 
 use crate::math::{
-    add_bias, apply_rope_partial_base, hadamard_inplace, matmul_blocked, rms_norm, silu_inplace,
+    add_bias,
+    apply_rope_adjacent_pairs,
+    apply_rope_partial_base,
+    hadamard_inplace,
+    matmul_blocked,
+    rms_norm,
+    silu_inplace,
     softmax_inplace,
 };
 use std::sync::OnceLock;
@@ -48,7 +55,7 @@ fn mean_abs(v: &[f32]) -> f32 {
     s / (v.len() as f32)
 }
 
-// kleine Hilfsfunktion: wende optionales Scaling an
+// optionale RoPE-Skalierung anwenden (einfaches Schema)
 fn apply_rope_scaling_if_enabled(base: f32, kind: Option<&str>, factor: Option<f32>) -> f32 {
     let do_apply = std::env::var("ROPE_SCALE_APPLY")
         .ok()
@@ -59,11 +66,35 @@ fn apply_rope_scaling_if_enabled(base: f32, kind: Option<&str>, factor: Option<f
     }
     let f = factor.unwrap_or(1.0);
     let k = kind.unwrap_or("");
-    // einfache, konservative Variante: base * factor
-    // (richtige NTK/Yarn-Formeln sind komplexer und können später ergänzt werden)
     match k {
         "linear" | "llama3" | "yarn" | "ntk" => base * f,
         _ => base,
+    }
+}
+
+// RoPE-Modus per ENV wählen: "adj" (adjacent pairs) oder "partial" (erste Hälfte mit zweiter Hälfte)
+// Standard: adjacent
+fn apply_rope_by_env(
+    q: &mut [f32],
+    k: &mut [f32],
+    head_dim: usize,
+    rope_dim: usize,
+    pos: usize,
+    base: f32,
+) {
+    let mode = std::env::var("ROPE_MODE")
+        .unwrap_or_else(|_| "adj".to_string())
+        .to_lowercase();
+    match mode.as_str() {
+        "adj" | "adjacent" => {
+            apply_rope_adjacent_pairs(q, k, head_dim, rope_dim, pos, base);
+        }
+        "half" | "partial" => {
+            apply_rope_partial_base(q, k, head_dim, rope_dim, pos, base);
+        }
+        _ => {
+            apply_rope_adjacent_pairs(q, k, head_dim, rope_dim, pos, base);
+        }
     }
 }
 
@@ -174,16 +205,8 @@ impl Attention {
             "hidden_size must be divisible by n_heads"
         );
 
-        let i_group = i_heads / i_kv_heads;
         let i_head_dim = i_hidden / i_heads;
         let i_kv_out = i_kv_heads * i_head_dim;
-
-        /*if dbg_on() {
-            println!(
-                "Attention::new | heads={} kv_heads={} head_dim={} max_seq={} rope_dim={} rope_base={}",
-                i_heads, i_kv_heads, i_head_dim, i_max_seq, i_rope_dim, i_rope_base
-            );
-        }*/
 
         Self {
             n_heads: i_heads,
@@ -216,33 +239,17 @@ impl Attention {
     }
 
     pub fn forward(&mut self, x: &[f32], i_pos: usize) -> Vec<f32> {
-        // positions größer als Kontext -> ring-buffer (schützt gegen oob)
+        // Positionen größer als Kontext -> ring-buffer
         let i_pos_eff = if self.max_seq_len == 0 {
             0
         } else {
             i_pos % self.max_seq_len
         };
-        /*if dbg_on() && i_pos != i_pos_eff {
-            println!(
-                "Attention::forward | warn: pos={} wrapped-> {} (max_seq_len={})",
-                i_pos, i_pos_eff, self.max_seq_len
-            );
-        }*/
 
         // Projektionen
         let v_q_all = self.w_q.forward(x); // [n_heads * head_dim]
         let v_k_all = self.w_k.forward(x); // [n_kv_heads * head_dim]
         let v_v_all = self.w_v.forward(x); // [n_kv_heads * head_dim]
-
-        /*if dbg_on() && i_pos_eff < 2 {
-            println!(
-                "dbg attn proj: pos={} mean|q|={:.6} mean|k|={:.6} mean|v|={:.6}",
-                i_pos_eff,
-                mean_abs(&v_q_all),
-                mean_abs(&v_k_all),
-                mean_abs(&v_v_all)
-            );
-        }*/
 
         // RoPE nur auf K (aktueller Schritt), dann in Cache
         for i_kvh in 0..self.n_kv_heads {
@@ -250,8 +257,9 @@ impl Attention {
             let i_end = i_start + self.head_dim;
             let mut v_kh = v_k_all[i_start..i_end].to_vec();
 
+            // K drehen (Q-Dummy), Modus per ENV
             let mut v_dummy_q = vec![0f32; self.head_dim];
-            apply_rope_partial_base(
+            apply_rope_by_env(
                 &mut v_dummy_q,
                 &mut v_kh,
                 self.head_dim,
@@ -272,7 +280,6 @@ impl Attention {
 
         // Gruppengröße für GQA
         let i_group = if self.n_kv_heads > 0 {
-            // exakt, da oben geprüft
             self.n_heads / self.n_kv_heads
         } else {
             1
@@ -288,9 +295,9 @@ impl Attention {
 
             let mut v_qh = v_q_all[i_q_start..i_q_end].to_vec();
 
-            // RoPE auf Q
+            // Q drehen (K-Dummy), Modus per ENV
             let mut v_dummy_k = vec![0f32; self.head_dim];
-            apply_rope_partial_base(
+            apply_rope_by_env(
                 &mut v_qh,
                 &mut v_dummy_k,
                 self.head_dim,
@@ -300,7 +307,7 @@ impl Attention {
             );
 
             // zugeordneter KV-Head (geclamped)
-            let mut i_kvh = i_h / i_group;
+            let mut i_kvh = if i_group == 0 { 0 } else { i_h / i_group };
             if self.n_kv_heads > 0 {
                 if i_kvh >= self.n_kv_heads {
                     i_kvh = self.n_kv_heads - 1;
@@ -345,16 +352,6 @@ impl Attention {
 
         // Output-Projektion
         let y = self.w_o.forward(&v_out_heads);
-
-        /*if dbg_on() && i_pos_eff < 2 {
-            println!(
-                "dbg attn out: pos={} mean|head_out|={:.6} mean|y|={:.6}",
-                i_pos_eff,
-                mean_abs(&v_out_heads),
-                mean_abs(&y)
-            );
-        }*/
-
         y
     }
 }
@@ -387,17 +384,6 @@ impl FeedForward {
         hadamard_inplace(&mut v_act, &v_up);
 
         let y = self.w2.forward(&v_act); // down
-
-        /*if dbg_on() {
-            println!(
-                "dbg ffn: mean|up|={:.6} mean|gate|={:.6} mean|act|={:.6} mean|y|={:.6}",
-                mean_abs(&v_up),
-                mean_abs(&v_act), // schon gate*silu(up), näherungsweise
-                mean_abs(&v_act),
-                mean_abs(&y)
-            );
-        }*/
-
         y
     }
 }
@@ -413,22 +399,6 @@ pub struct TransformerBlock {
 
 impl TransformerBlock {
     pub fn new(cfg: &ModelConfig) -> Self {
-        /*if dbg_on() {
-            println!(
-                "TransformerBlock::new | hidden={} heads={} kv_heads={} inter={} max_seq={} rope_dim={} rope_base={} rms_eps={} rope_scaling={:?} factor={:?}",
-                cfg.hidden_size,
-                cfg.n_heads,
-                cfg.n_kv_heads,
-                cfg.intermediate_size,
-                cfg.max_seq_len,
-                cfg.rope_dim,
-                cfg.rope_base,
-                cfg.rms_eps,
-                cfg.rope_scaling_type,
-                cfg.rope_scaling_factor
-            );
-        }*/
-
         // hier ggf. rope_base mit Scaling anwenden
         let rope_base_eff = apply_rope_scaling_if_enabled(
             cfg.rope_base,
@@ -458,14 +428,7 @@ impl TransformerBlock {
 
     pub fn forward(&mut self, x: &[f32], i_pos: usize) -> Vec<f32> {
         let a = self.ln1.forward(x);
-        /*if dbg_on() && i_pos < 2 {
-            println!("dbg ln1: pos={} mean|a|={:.6}", i_pos, mean_abs(&a));
-        }*/
-
         let a2 = self.attn.forward(&a, i_pos);
-        /*if dbg_on() && i_pos < 2 {
-            println!("dbg attn: pos={} mean|a2|={:.6}", i_pos, mean_abs(&a2));
-        }*/
 
         let mut h = vec![0f32; x.len()];
         for i in 0..x.len() {
@@ -474,9 +437,6 @@ impl TransformerBlock {
 
         let m = self.ln2.forward(&h);
         let m2 = self.ffn.forward(&m);
-        /*if dbg_on() && i_pos < 2 {
-            println!("dbg ffn: pos={} mean|m2|={:.6}", i_pos, mean_abs(&m2));
-        }*/
 
         let mut y = vec![0f32; h.len()];
         for i in 0..h.len() {
@@ -491,38 +451,18 @@ impl TransformerBlock {
 #[derive(Clone)]
 pub struct TransformerModel {
     pub cfg: ModelConfig,
-    pub tok_emb: Vec<f32>, // [vocab, hidden]
-    pub lm_head: Vec<f32>, // [hidden, vocab]
+    pub tok_emb: Vec<f32>,  // [vocab, hidden]
+    pub lm_head: Vec<f32>,  // [hidden, vocab]
     pub blocks: Vec<TransformerBlock>,
     pub final_norm: RMSNorm,
 }
 
 impl TransformerModel {
     pub fn new_empty(cfg: ModelConfig) -> Self {
-        /*if dbg_on() {
-            println!(
-                "TransformerModel::new_empty | vocab={} hidden={} layers={} heads={} kv_heads={} inter={} ctx={} rope_dim={} rope_base={} rms_eps={} rope_scaling={:?} factor={:?}",
-                cfg.vocab_size,
-                cfg.hidden_size,
-                cfg.n_layers,
-                cfg.n_heads,
-                cfg.n_kv_heads,
-                cfg.intermediate_size,
-                cfg.max_seq_len,
-                cfg.rope_dim,
-                cfg.rope_base,
-                cfg.rms_eps,
-                cfg.rope_scaling_type,
-                cfg.rope_scaling_factor
-            );
-        }*/
-
         Self {
             tok_emb: vec![0.0; cfg.vocab_size * cfg.hidden_size],
             lm_head: vec![0.0; cfg.hidden_size * cfg.vocab_size],
-            blocks: (0..cfg.n_layers)
-                .map(|_| TransformerBlock::new(&cfg))
-                .collect(),
+            blocks: (0..cfg.n_layers).map(|_| TransformerBlock::new(&cfg)).collect(),
             // finale Norm auch mit cfg.rms_eps
             final_norm: RMSNorm::new(cfg.hidden_size, cfg.rms_eps),
             cfg,
@@ -549,34 +489,13 @@ impl TransformerModel {
             x[i] = row[i];
         }
 
-        /*if dbg_on() && i_pos < 2 {
-            println!(
-                "dbg emb: pos={} tok_id={} mean|emb|={:.6}",
-                i_pos,
-                i_token_id,
-                mean_abs(&x)
-            );
-        }*/
-
         // durch die Blöcke
-        for (i_b, blk) in self.blocks.iter_mut().enumerate() {
+        for blk in self.blocks.iter_mut() {
             x = blk.forward(&x, i_pos);
-
-
-            /*if dbg_on() && i_pos == 0 && i_b == 0 {
-                println!(
-                    "dbg block0 out: mean|x|={:.6} (nach attn+ffn)",
-                    mean_abs(&x)
-                );
-            }*/
         }
 
         // finale Norm
         x = self.final_norm.forward(&x);
-
-        /*if dbg_on() && i_pos < 2 {
-            println!("dbg final norm: pos={} mean|x|={:.6}", i_pos, mean_abs(&x));
-        }*/
 
         // LM-Head
         let mut logits = vec![0f32; self.cfg.vocab_size];
@@ -588,23 +507,6 @@ impl TransformerModel {
             self.cfg.vocab_size,
             &mut logits,
         );
-
-        /*if dbg_on() && i_pos < 2 {
-            // Mini-Statistik statt Top-N hier (Top-N gern im Aufrufer)
-            let mut max_abs = 0.0f32;
-            for &v in &logits {
-                let a = v.abs();
-                if a > max_abs {
-                    max_abs = a;
-                }
-            }
-            println!(
-                "dbg logits: pos={} mean|logits|={:.6} max|logits|={:.6}",
-                i_pos,
-                mean_abs(&logits),
-                max_abs
-            );
-        }*/
 
         Ok(logits)
     }
