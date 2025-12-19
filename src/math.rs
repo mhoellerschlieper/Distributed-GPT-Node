@@ -337,3 +337,15 @@ pub fn apply_rope_adjacent_pairs(
     }
 }
 
+/// Liefert den Mittelwert der Absolutwerte.
+/// Brauchbar für schnelle Debug-Ausgaben.
+pub fn mean_abs(v: &[f32]) -> f32 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    let mut sum = 0.0f32;
+    for &x in v {
+        sum += x.abs();
+    }
+    sum / v.len() as f32
+}

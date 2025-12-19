@@ -4,7 +4,7 @@
 // Hinweis: Stelle sicher, dass in src/main.rs steht:
 //   #[cfg(test)]
 //   mod tests;
-// Start: $env:MODEL_PATH="c:\Entwicklung\rust\GPT-GGUF\model\vibethinker-1.5b-q8_0.gguf"; $env:GOLDEN_JSON="c:\Entwicklung\rust\GPT-GGUF\src\golden.json";$env:BPE_ADD_PREFIX_SPACE="0"; cargo test --tests golden_step_tests -- --nocapture
+// Start: $env:MODEL_PATH="c:\Entwicklung\rust\GPT-GGUF\model\vibethinker-1.5b-q8_0.gguf"; $env:GOLDEN_JSON="c:\Entwicklung\rust\GPT-GGUF\src\golden.json";$env:BPE_ADD_PREFIX_SPACE="0"; cargo test -- --nocapture
 
 #[cfg(test)]
 
@@ -2361,7 +2361,7 @@ mod golden_step_tests {
     // Prüft: encode(text) == golden.token_ids
     #[test]
     fn test_golden_tokenizer_parity_if_text_given() {
-        let s_golden = "c:\\Entwicklung\\rust\\GPT-GGUF\\src\\golden.json";
+        let s_golden = r"c:\Entwicklung\rust\GPT-GGUF\src\golden.json";
 
         /*match std::env::var("GOLDEN_JSON") {
             Ok(v) => v,

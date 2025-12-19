@@ -383,7 +383,7 @@ fn main() -> Result<(), String> {
         "Nutze Sampling: temp={}, top_k={}, top_p={}",
         d_temperature, i_top_k, d_top_p
     );
-    println!("Hinweis: PROMPT_TPL=simple|inst|chatml|im (ENV) wählbar.");
+    println!("Hinweis: PROMPT_TPL=simple|inst|chatml|im (ENV) wählbar.");  
 
     // 7) Interaktive Schleife
     let mut s_input = String::new();
@@ -405,7 +405,7 @@ fn main() -> Result<(), String> {
 
         // System-Text aus ENV oder Default
         let s_system = std::env::var("SYSTEM_PROMPT")
-            .unwrap_or_else(|_| "Du bist eine hilfreiche Assistenz.".to_string());
+            .unwrap_or_else(|_| "You are a helpful assistent.".to_string());
 
         // Prompt bauen
         let s_prompt = build_prompt(tpl, &s_system, s_line);

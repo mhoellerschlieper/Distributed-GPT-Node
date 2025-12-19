@@ -427,20 +427,26 @@ impl TransformerBlock {
     }
 
     pub fn forward(&mut self, x: &[f32], i_pos: usize) -> Vec<f32> {
+        //=========================================
+        // Teil 1: RMSNorm + Attention
+        //=========================================
         let a = self.ln1.forward(x);
         let a2 = self.attn.forward(&a, i_pos);
 
         let mut h = vec![0f32; x.len()];
         for i in 0..x.len() {
-            h[i] = x[i] + a2[i];
+            h[i] = x[i] + a2[i]; // Erster Skip-Schritt (nach der Attention)
         }
 
+        //=========================================
+        // Teil 2: RMSNorm + FeedForward
+        //=========================================
         let m = self.ln2.forward(&h);
         let m2 = self.ffn.forward(&m);
 
         let mut y = vec![0f32; h.len()];
         for i in 0..h.len() {
-            y[i] = h[i] + m2[i];
+            y[i] = h[i] + m2[i]; // Zweiter Skip-Schritt (nach dem Feed-Forward)
         }
 
         y

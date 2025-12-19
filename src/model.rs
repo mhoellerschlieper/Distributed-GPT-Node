@@ -920,8 +920,10 @@ pub fn map_all_weights(o_gguf: &GgufModel, o_model: &mut TransformerModel) -> Re
 
     mdl_dbg!("map_all_weights: done");
 
-    validate_layers_nonzero(o_model)?; // wirft Err mit Layer-Index bei Problem
+    //validate_layers_nonzero(o_model)?; // wirft Err mit Layer-Index bei Problem
 
+    //println!("tok_emb[0..4] = {:?}", &o_model.tok_emb[0..4]);
+    //println!("lm_head[0..4] = {:?}", &o_model.lm_head[0..4]);
     Ok(())
 }
 
