@@ -1,392 +1,367 @@
 // main.rs
-// CPU-only GGUF v3 Inferenz: automatisches Erkennen von RoPE-Basis, RoPE-Drehung und Prompt-Template
+// ------------------------------------------------------------
+// Chat mit Streaming, Stop-IDs, Template-Erkennung
+// Backend wählbar: "candle" (schneller) oder "transformers" (eigener CPU-Forward)
 // Autor: Marcus Schlieper, ExpChat.ai
-// Kontakt: mschlieper@expchat.ai | Tel: 49 2338 8748862 | Mobil: 49 15115751864
-// Firma: ExpChat.ai – Der KI Chat Client für den Mittelstand aus Breckerfeld im Sauerland.
-//        RPA, KI Agents, KI Internet Research, KI Wissensmanagement.
-//        Adresse: Epscheider Str21, 58339 Breckerfeld
+// Kontakt: mschlieper@ylook.de | 49 2338 8748862 | 49 15115751864
+// Firma: ExpChat.ai – Der KI Chat Client für den Mittelstand aus Breckerfeld
+// Zusatz: RPA, KI Agents, KI Internet Research, KI Wissensmanagement
+// Stand: 2025-12-23
+// Lizenz: MIT / Apache-2.0
 //
-// Hinweise:
-// - Modelldaten und Mapping: model.rs
-// - Layer/Mathe/Sampling: layer.rs, math.rs
-// - GGUF-Lader: gguf_loader.rs
-// - Tokenizer (Unigram + BPE aus GGUF): tokenizer.rs
-// - Utils: utils.rs (enthält detect_settings, RopeMode, ChatTpl, …)
-//
-//  
-//  $env:MODEL_DEBUG="0";$env:ROPE_SCALE_APPLY="1";$env:FORCE_KV_HEADS="1";$env:RUST_DECODE_TEST="0";$env:RUST_LLAMA_CHECK="0";$env:PROMPT_TPL="turn"; cargo run --release
+// Sicherheit:
+// - kein unsafe
+// - klare Fehler
+// - robustes Streaming ohne zerschossene UTF-8-Ausgabe
+// ------------------------------------------------------------
 
-mod gguf_loader;
-mod layer;
-mod math;
-mod model;
-mod tokenizer;
-mod utils;
+#![allow(warnings)]
 
-use gguf_loader::{GgufModel, GgufValue, load_gguf};
-use layer::TransformerModel;
-use math::{SimpleRng, sample_top_k_top_p_temperature};
-use model::{build_config, init_debug_from_env, map_all_weights, mean_abs};
-use tokenizer::{GgufTokenizer, gguf_tokenizer_from_kv};
-use utils::{ChatTpl, DetectedSettings, detect_settings};
+mod model; // eigenes CPU-Transformers-Backend (safetensors)
+mod models_candle; // Candle-Backend (safetensors)
+mod tokenizer; // Tokenizer aus tokenizer.json
 
-use std::collections::HashMap;
 use std::io::{self, Write};
 
-#[cfg(test)]
-mod tests;
+// ---------------- Env-Helper ----------------
 
-// =============== Kleine ENV-Helper ===============
-fn env_f32(key: &str, default: f32) -> f32 {
-    std::env::var(key)
+fn env_f32(k: &str, d: f32) -> f32 {
+    std::env::var(k)
         .ok()
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(default)
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(d)
+}
+fn env_usize(k: &str, d: usize) -> usize {
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(d)
+}
+fn debug_on() -> bool {
+    matches!(std::env::var("DEBUG_MODEL"), Ok(s) if s != "0")
 }
 
-fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(default)
+// ---------------- Prompt-Templates ----------------
+
+#[derive(Clone, Copy, Debug)]
+enum ChatTemplate {
+    ChatMLIm,
+    ChatML,
+    Llama3,
+    Llama2,
+    Mistral,
+    Gemma,
+    Alpaca,
+    SimpleTags,
 }
 
-fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(default)
-}
-
-fn env_bool(key: &str) -> bool {
-    std::env::var(key)
-        .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+fn token_exists(tok: &tokenizer::GgufTokenizer, s: &str) -> bool {
+    tok.encode(s, false)
+        .map(|ids| ids.len() == 1)
         .unwrap_or(false)
 }
 
-// =============== Prompt-Helfer ===============
-// Toleranter Token-Check (wie in utils.rs)
-fn vocab_has_all_anyform(kv: &std::collections::HashMap<String, GgufValue>, need: &[&str]) -> bool {
-    let Some(GgufValue::ArrStr(tokens)) = kv.get("tokenizer.ggml.tokens") else {
-        return false;
-    };
-    let has_any = |pat: &str| {
-        let with_space = format!(" {}", pat);
-        let with_underscore = format!("\u{2581}{}", pat);
-        tokens
-            .iter()
-            .any(|t| t == pat || t == &with_space || t == &with_underscore)
-    };
-    need.iter().all(|p| has_any(p))
-}
-
-// Promptbauer für alle Templates
-fn build_prompt(tpl: ChatTpl, s_system: &str, s_user: &str) -> String {
-    match tpl {
-        ChatTpl::ChatMl => format!(
-            "<|system|>\n{}\n<|user|>\n{}\n<|assistant|>\n",
-            s_system, s_user
-        ),
-        ChatTpl::ImTags => format!(
-            "<|im_start|>system\n{}\n<|im_end|>\n<|im_start|>user\n{}\n<|im_end|>\n<|im_start|>assistant\n",
-            s_system, s_user
-        ),
-        ChatTpl::Inst => format!(
-            "[INST] <<SYS>>\n{}\n<</SYS>>\n{}\n[/INST]\n",
-            s_system, s_user
-        ),
-        ChatTpl::Simple => format!("System: {}\nUser: {}\nAssistant:", s_system, s_user),
-
-        // Neu:
-        ChatTpl::Llama3 => format!(
-            "<|start_header_id|>system<|end_header_id|>\n{}<|eot_id|>\n\
-             <|start_header_id|>user<|end_header_id|>\n{}<|eot_id|>\n\
-             <|start_header_id|>assistant<|end_header_id|>\n",
-            s_system, s_user
-        ),
-        ChatTpl::Gemma => format!(
-            "<start_of_turn>system\n{}\n<end_of_turn>\n\
-             <start_of_turn>user\n{}\n<end_of_turn>\n\
-             <start_of_turn>model\n",
-            s_system, s_user
-        ),
-        ChatTpl::TurnPipes => format!(
-            "<|start_of_turn|>system\n{}\n<|end_of_turn|>\n\
-             <|start_of_turn|>user\n{}\n<|end_of_turn|>\n\
-             <|start_of_turn|>assistant\n",
-            s_system, s_user
-        ),
-        ChatTpl::Alpaca => format!(
-            "### Instruction:\n{}\n\n### Input:\n{}\n\n### Response:\n",
-            s_system, s_user
-        ),
-        ChatTpl::Vicuna => format!("SYSTEM: {}\nUSER: {}\nASSISTANT:", s_system, s_user),
+fn detect_chat_template(tok: &tokenizer::GgufTokenizer) -> ChatTemplate {
+    if let Ok(sel) = std::env::var("CHAT_TEMPLATE") {
+        let s = sel.to_lowercase();
+        return match s.as_str() {
+            "qwen" | "chatml_im" | "im" => ChatTemplate::ChatMLIm,
+            "chatml" => ChatTemplate::ChatML,
+            "llama3" => ChatTemplate::Llama3,
+            "llama2" => ChatTemplate::Llama2,
+            "mistral" => ChatTemplate::Mistral,
+            "gemma" => ChatTemplate::Gemma,
+            "alpaca" => ChatTemplate::Alpaca,
+            _ => ChatTemplate::SimpleTags,
+        };
     }
+    // Auto-Heuristik
+    if token_exists(tok, "<|start_header_id|>")
+        && token_exists(tok, "<|end_header_id|>")
+        && token_exists(tok, "<|eot_id|>")
+    {
+        return ChatTemplate::Llama3;
+    }
+    if token_exists(tok, "<|im_start|>") && token_exists(tok, "<|im_end|>") {
+        return ChatTemplate::ChatMLIm;
+    }
+    if token_exists(tok, "<|system|>")
+        && token_exists(tok, "<|user|>")
+        && token_exists(tok, "<|assistant|>")
+    {
+        return ChatTemplate::ChatML;
+    }
+    if token_exists(tok, "[INST]") && token_exists(tok, "[/INST]") {
+        // ohne SYS-Blöcke -> Mistral
+        return ChatTemplate::Mistral;
+    }
+    if token_exists(tok, "###") || token_exists(tok, "### Instruction:") {
+        return ChatTemplate::Alpaca;
+    }
+    ChatTemplate::SimpleTags
 }
 
-// Nur für kompakte Debug-Ausgabe
-fn visible_token(s_src: &str) -> String {
-    let mut s_out = String::new();
-    for ch in s_src.chars() {
-        match ch {
-            '\n' => s_out.push_str("\\n"),
-            '\r' => s_out.push_str("\\r"),
-            '\t' => s_out.push_str("\\t"),
-            c if c.is_control() => s_out.push('?'),
-            c => s_out.push(c),
+fn build_first_turn(
+    fmt: ChatTemplate,
+    tok: &tokenizer::GgufTokenizer,
+    system_opt: Option<&str>,
+    user: &str,
+) -> String {
+    match fmt {
+        ChatTemplate::ChatMLIm => {
+            let sys = system_opt.unwrap_or("You are a helpful assistant.");
+            let mut s = String::new();
+            if token_exists(tok, "<|begin_of_text|>") {
+                s.push_str("<|begin_of_text|>");
+            }
+            s.push_str(&format!(
+                "<|im_start|>system\n{}\n<|im_end|>\n<|im_start|>user\n{}\n<|im_end|>\n<|im_start|>assistant\n",
+                sys, user
+            ));
+            s
         }
-    }
-    s_out
-}
-
-// Prüfe, ob alle benötigten Template-Tokens im Vokabular vorhanden sind
-fn vocab_has_all(kv: &HashMap<String, GgufValue>, need: &[&str]) -> bool {
-    let Some(GgufValue::ArrStr(tokens)) = kv.get("tokenizer.ggml.tokens") else {
-        return false;
-    };
-    let has_any_form = |pat: &str| {
-        let with_space = format!(" {}", pat);
-        let with_underscore = format!("\u{2581}{}", pat);
-        tokens
-            .iter()
-            .any(|t| t == pat || t == &with_space || t == &with_underscore)
-    };
-    need.iter().all(|p| has_any_form(p))
-}
-
-// =============== Optionale Tools (schnelle Checks) ===============
-fn run_encode_decode_test(s_model_path: &str) -> Result<(), String> {
-    println!("\n== Encode/Decode Test (Rust) ==");
-    let gguf = load_gguf(s_model_path)?;
-    let tok = gguf_tokenizer_from_kv(&gguf.kv)?;
-    let s_text = "Hello world!";
-
-    let ids_plain = tok.encode(s_text, false)?;
-    println!("Input: {}", s_text);
-    println!("Tokens (no special): {:?}", ids_plain);
-    let s_back_plain = tok.decode(&ids_plain, true)?;
-    println!("Decoded (skip special): {}", s_back_plain);
-
-    let ids_special = tok.encode(s_text, true)?;
-    println!("Tokens (with special): {:?}", ids_special);
-    let s_back_special = tok.decode(&ids_special, true)?;
-    println!("Decoded (skip special): {}", s_back_special);
-
-    print!("Per-token decode: ");
-    for &id in &ids_plain {
-        let piece = tok
-            .decode(&[id], true)
-            .unwrap_or_default()
-            .replace('\n', "\\n");
-        print!("[{}:{}] ", id, piece);
-    }
-    println!();
-    Ok(())
-}
-
-fn run_model_info_check() -> Result<(), String> {
-    //let default_model = r"C:\Entwicklung\rust\GPT-GGUF\model\tinyllama-1.1b-chat-v1.0.Q8_0.gguf";
-    //let s_model_path = std::env::var("MODEL_PATH").unwrap_or_else(|_| default_model.to_string());
-
-    let s_model_path = r"c:\Entwicklung\rust\GPT-GGUF\model\tinyllama-1.1b-chat-v1.0.Q8_0.gguf";
-    println!("Lade Modell: {}", s_model_path);
-    let gguf = load_gguf(&s_model_path)?;
-    let _tok = gguf_tokenizer_from_kv(&gguf.kv)?;
-
-    let arch = gguf
-        .get_kv_str("general.architecture")
-        .unwrap_or_else(|| "unknown".to_string());
-    let vocab_size = gguf
-        .get_kv_u32("tokenizer.vocab_size")
-        .map(|v| v as usize)
-        .or_else(|| {
-            if let Some(GgufValue::ArrStr(v)) = gguf.kv.get("tokenizer.ggml.tokens") {
-                Some(v.len())
+        ChatTemplate::ChatML => {
+            let sys = system_opt.unwrap_or("You are a helpful assistant.");
+            format!(
+                "<|system|>\n{}\n\n<|user|>\n{}\n\n<|assistant|>\n",
+                sys, user
+            )
+        }
+        ChatTemplate::Llama3 => {
+            let sys = system_opt.unwrap_or("You are a helpful assistant.");
+            format!(
+                "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{}\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{}\n<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+                sys, user
+            )
+        }
+        ChatTemplate::Llama2 => {
+            let sys = system_opt.unwrap_or("You are a helpful assistant.");
+            format!("[INST] <<SYS>>\n{}\n<</SYS>>\n\n{} [/INST]\n", sys, user)
+        }
+        ChatTemplate::Mistral => {
+            format!("[INST] {}\n[/INST]\n", user)
+        }
+        ChatTemplate::Gemma => {
+            let sys = system_opt.unwrap_or("You are a helpful assistant.");
+            format!("system\n{}\nuser\n{}\nmodel\n", sys, user)
+        }
+        ChatTemplate::Alpaca => {
+            if let Some(sys) = system_opt {
+                format!(
+                    "### System:\n{}\n\n### Instruction:\n{}\n\n### Response:\n",
+                    sys, user
+                )
             } else {
-                None
+                format!("### Instruction:\n{}\n\n### Response:\n", user)
             }
-        })
-        .unwrap_or(0);
-
-    println!("{{");
-    println!(
-        "  \"model_path\": \"{}\",",
-        s_model_path.replace('\\', "\\\\")
-    );
-    println!("  \"architecture\": \"{}\",", arch);
-    println!("  \"vocab_size\": {}", vocab_size);
-    println!("}}");
-
-    println!("\n== Tokens (0..29) ==");
-    for tid in 0..900usize {
-        let piece = _tok.decode(&[tid], false).unwrap_or_default();
-        let shown = escape_token_piece(&piece);
-        println!("{:>6} | {}", tid, shown);
-    }
-    Ok(())
-}
-
-fn escape_token_piece(s: &str) -> String {
-    let mut out = String::new();
-    for ch in s.chars() {
-        match ch {
-            '\n' => out.push_str("\\n"),
-            '\t' => out.push_str("\\t"),
-            '\r' => out.push_str("\\r"),
-            c if c.is_control() => {
-                let code = c as u32;
-                if code <= 0xFF {
-                    out.push_str(&format!("\\x{:02x}", code));
-                } else {
-                    out.push_str(&format!("\\u{{{:x}}}", code));
-                }
+        }
+        ChatTemplate::SimpleTags => {
+            let mut s = String::new();
+            if let Some(sys) = system_opt {
+                s.push_str(&format!("<|system|>\n{}\n", sys));
             }
-            c => out.push(c),
+            s.push_str(&format!("<|user|>\n{}\n<|assistant|>\n", user));
+            s
         }
     }
-    format!("'{}'", out)
 }
 
-// =============== Hauptprogramm ===============
-fn main() -> Result<(), String> {
-    // Debug-Schalter aus ENV übernehmen (MODEL_DEBUG=1)
-    init_debug_from_env();
-
-    // Optionale Einzweck-Checks
-    if env_bool("RUST_DECODE_TEST") {
-        let path = std::env::var("MODEL_PATH").unwrap_or_else(|_| {
-            r"C:\Entwicklung\rust\GPT-GGUF\model\tinyllama-1.1b-chat-v1.0.Q8_0.gguf".to_string()
-        });
-        return run_encode_decode_test(&path);
+fn build_next_turn(fmt: ChatTemplate, user: &str) -> String {
+    match fmt {
+        ChatTemplate::ChatMLIm => {
+            format!(
+                "<|im_start|>user\n{}\n<|im_end|>\n<|im_start|>assistant\n",
+                user
+            )
+        }
+        ChatTemplate::ChatML => {
+            format!("<|user|>\n{}\n\n<|assistant|>\n", user)
+        }
+        ChatTemplate::Llama3 => {
+            format!(
+                "<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{}\n<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+                user
+            )
+        }
+        ChatTemplate::Llama2 | ChatTemplate::Mistral => {
+            format!("[INST] {}\n[/INST]\n", user)
+        }
+        ChatTemplate::Gemma => {
+            format!("user\n{}\nmodel\n", user)
+        }
+        ChatTemplate::Alpaca => {
+            format!("### Instruction:\n{}\n\n### Response:\n", user)
+        }
+        ChatTemplate::SimpleTags => {
+            format!("<|user|>\n{}\n<|assistant|>\n", user)
+        }
     }
-    if env_bool("RUST_LLAMA_CHECK") {
-        return run_model_info_check();
+}
+
+fn default_stops_for_template(fmt: ChatTemplate) -> Vec<String> {
+    match fmt {
+        ChatTemplate::ChatMLIm => vec!["<|im_end|>".to_string()],
+        ChatTemplate::ChatML => vec!["<|end|>".to_string()],
+        ChatTemplate::Llama3 => vec!["<|eot_id|>".to_string()],
+        ChatTemplate::Llama2 => vec!["[/INST]".to_string(), "</s>".to_string()],
+        ChatTemplate::Mistral => vec!["[/INST]".to_string()],
+        ChatTemplate::Gemma => vec!["model".to_string()],
+        ChatTemplate::Alpaca => vec!["### Instruction:".to_string(), "### Input:".to_string()],
+        ChatTemplate::SimpleTags => vec!["<|user|>".to_string()],
     }
+}
 
-    // Modellpfad (ENV überschreibbar)
-    //let s_model_path = std::env::var("MODEL_PATH").unwrap_or_else(|_| {
-    //    r"C:\Entwicklung\rust\GPT-GGUF\model\tinyllama-1.1b-chat-v1.0.Q8_0.gguf".to_string()
-    //});
-
-    //let s_model_path = r"C:\Entwicklung\rust\GPT-GGUF\model\tinyllama-1.1b-chat-v1.0.Q8_0.gguf".to_string(); // <= wird geladen
-    //let s_model_path =r"c:\Entwicklung\rust\GPT-GGUF\model\Cinder-Phi-2-V1.F16(1).gguf".to_string(); // <= wird geladen
-    let s_model_path =r"c:\Entwicklung\rust\GPT-GGUF\model\vibethinker-1.5b-q8_0.gguf".to_string(); // <= wird geladen
-    ////let s_model_path =r"c:\Entwicklung\rust\GPT-GGUF\model\gemma-2-9b-it-Q4_K_M-fp16.gguf".to_string(); // <= wird NICHT geladen
-    ////let s_model_path =r"c:\Entwicklung\rust\GPT-GGUF\model\tinyllama-1.1b-chat-v1.0.Q4_K_S.gguf".to_string(); // <= wird NICHT geladen
-
-    println!("Lade GGUF: {}", s_model_path);
-    let gguf: GgufModel = load_gguf(&s_model_path)?;
-
-    // 1) Einstellungen automatisch erkennen (Architektur, RoPE-Basis, Template)
-    let DetectedSettings {
-        rope_base,
-        rope_mode: _rope_mode, // aktuell nicht in main verwendet; Layer nutzt eigene Implementierung
-        tpl: detected_tpl,
-    } = detect_settings(&gguf.kv);
-
-    // 2) Konfiguration aus GGUF lesen und (falls nötig) mit erkannter RoPE-Basis überschreiben
-    let mut cfg = build_config(&gguf);
-    // Nur überschreiben, wenn ENV nicht explizit ROPE_THETA vorgibt:
-    if std::env::var("ROPE_THETA").is_err() {
-        cfg.rope_base = rope_base;
+fn env_or_default_stops(tok: &tokenizer::GgufTokenizer, fmt: ChatTemplate) -> Vec<String> {
+    if let Ok(raw) = std::env::var("STOP") {
+        let it = if raw.contains("||") {
+            raw.split("||")
+        } else {
+            raw.split(",")
+        };
+        it.map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else {
+        let mut v = default_stops_for_template(fmt);
+        // nur Strings behalten, die als 1-Token existieren – falls nicht, behalten wir sie trotzdem (konservativ)
+        // v.retain(|s| token_exists(tok, s)); // optional
+        v
     }
-    println!(
-        "Model config: layers={} heads={} kv_heads={} hidden={} vocab={} ctx={} rope_dim={} rope_base={}",
-        cfg.n_layers,
-        cfg.n_heads,
-        cfg.n_kv_heads,
-        cfg.hidden_size,
-        cfg.vocab_size,
-        cfg.max_seq_len,
-        cfg.rope_dim,
-        cfg.rope_base
-    );
+}
 
-    // 3) Tokenizer aufbauen
-    let tok: GgufTokenizer =
-        gguf_tokenizer_from_kv(&gguf.kv).map_err(|e| format!("Tokenizer-Fehler: {}", e))?;
-    //build_unigram_tokenizer(&gguf.kv).map_err(|e| format!("Tokenizer-Fehler: {}", e))?;
-    //build_bpe_tokenizer(&gguf.kv).map_err(|e| format!("Tokenizer-Fehler: {}", e))?;
+// ---------------- Stop-IDs ----------------
 
-    // 4) Modell instanziieren und Gewichte mappen
-    let mut model = TransformerModel::new_empty(cfg.clone());
-    map_all_weights(&gguf, &mut model)?;
-    println!("Gewichte gemappt.");
-    println!("dbg |tok_emb|mean| = {:.6}", mean_abs(&model.tok_emb));
-    println!("dbg |lm_head|mean| = {:.6}", mean_abs(&model.lm_head));
-    if !model.blocks.is_empty() {
-        println!(
-            "dbg |blk0.w_q|mean| = {:.6}",
-            mean_abs(&model.blocks[0].attn.w_q.w)
-        );
-        println!(
-            "dbg |blk0.w1|mean|  = {:.6}",
-            mean_abs(&model.blocks[0].ffn.w1.w)
-        );
+fn compile_stop_id_sequences(tok: &tokenizer::GgufTokenizer, stop_str: &[String]) -> Vec<Vec<u32>> {
+    let mut v_seqs: Vec<Vec<u32>> = Vec::new();
+    for s in stop_str {
+        if let Ok(ids) = tok.encode(s, false) {
+            if !ids.is_empty() {
+                v_seqs.push(ids);
+            }
+        }
     }
+    v_seqs
+}
 
-    // 5) Prompt-Template wählen: automatische Erkennung, aber ENV-PROMPT_TPL erlaubt Override
-    let tpl_from_env = std::env::var("PROMPT_TPL")
-        .ok()
-        .map(|s| s.to_lowercase())
-        .and_then(|s| match s.as_str() {
-            "chatml" => Some(ChatTpl::ChatMl),
-            "im" | "imtags" => Some(ChatTpl::ImTags),
-            "inst" => Some(ChatTpl::Inst),
-            "simple" => Some(ChatTpl::Simple),
-            "llama3" => Some(ChatTpl::Llama3),
-            "gemma" => Some(ChatTpl::Gemma),
-            "turn" | "turnpipes" => Some(ChatTpl::TurnPipes),
-            "alpaca" => Some(ChatTpl::Alpaca),
-            "vicuna" => Some(ChatTpl::Vicuna),
-            _ => None,
-        });
+fn max_stop_len(v_stop_ids: &[Vec<u32>]) -> usize {
+    v_stop_ids.iter().map(|v| v.len()).max().unwrap_or(0)
+}
 
-    // let mut tpl = tpl_from_env.unwrap_or(detected_tpl);
+// ---------------- Sampler-Fallback ----------------
 
-    let mut tpl = detected_tpl;
-    if matches!(tpl, ChatTpl::Simple) {
-        tpl = utils::guess_template_from_model(&gguf.kv);
+fn pick_top1(v_logits: &[f32], d_temp: f32) -> usize {
+    let inv_t = if d_temp > 0.0 { 1.0 / d_temp } else { 1.0 };
+    let mut i_best = 0usize;
+    let mut d_best = f32::MIN;
+    for (i, &v) in v_logits.iter().enumerate() {
+        let vt = v * inv_t;
+        if vt > d_best {
+            d_best = vt;
+            i_best = i;
+        }
     }
+    i_best
+}
 
-    // Wenn Template-Spezialtokens fehlen, auf Simple zurückfallen (nur die, die echte Spezialtokens erwarten)
-    let need = match tpl {
-        ChatTpl::ImTags => vec!["<|im_start|>", "<|im_end|>"],
-        ChatTpl::ChatMl => vec!["<|system|>", "<|user|>", "<|assistant|>"],
-        ChatTpl::Inst => vec!["[INST]", "[/INST]"],
-        ChatTpl::Llama3 => vec!["<|start_header_id|>", "<|end_header_id|>", "<|eot_id|>"],
-        ChatTpl::Gemma => vec!["<start_of_turn>", "<end_of_turn>"],
-        ChatTpl::TurnPipes => vec!["<|start_of_turn|>", "<|end_of_turn|>"],
-        // Alpaca/Vicuna haben keine speziellen Vokabel-Tokens
-        ChatTpl::Alpaca | ChatTpl::Vicuna | ChatTpl::Simple => vec![],
+// ---------------- Gemeinsames Backend-Trait ----------------
+
+trait LmBackend {
+    fn forward_tokens(&mut self, ids: &[u32]) -> Result<Vec<f32>, String>;
+    fn vocab_size(&self) -> usize;
+}
+
+// Custom: TransformerModel (safetensors)
+impl LmBackend for model::TransformerModel {
+    fn forward_tokens(&mut self, ids: &[u32]) -> Result<Vec<f32>, String> {
+        model::TransformerModel::forward_tokens(self, ids)
+    }
+    fn vocab_size(&self) -> usize {
+        model::TransformerModel::vocab_size(self)
+    }
+}
+
+// Candle (safetensors)
+impl LmBackend for models_candle::CandleLlamaModel {
+    fn forward_tokens(&mut self, ids: &[u32]) -> Result<Vec<f32>, String> {
+        models_candle::CandleLlamaModel::forward_tokens(self, ids)
+    }
+    fn vocab_size(&self) -> usize {
+        models_candle::CandleLlamaModel::vocab_size(self)
+    }
+}
+
+// Backend wählen
+fn build_backend() -> Result<Box<dyn LmBackend>, String> {
+    let s_weights =
+        std::env::var("LLAMA_WEIGHTS").map_err(|_| "Env LLAMA_WEIGHTS fehlt".to_string())?;
+    let s_config =
+        std::env::var("LLAMA_CONFIG").map_err(|_| "Env LLAMA_CONFIG fehlt".to_string())?;
+    let which = std::env::var("BACKEND")
+        .unwrap_or_else(|_| "candle".to_string())
+        .to_lowercase();
+    let dt = match std::env::var("LLAMA_DTYPE")
+        .unwrap_or_else(|_| "f32".to_string())
+        .as_str()
+    {
+        "f16" => candle::DType::F16,
+        "bf16" => candle::DType::BF16,
+        _ => candle::DType::F32,
     };
-
-    if !need.is_empty() && !vocab_has_all_anyform(&gguf.kv, &need) {
-        println!("Warnung: Template-Tokens fehlen im Vokabular von {:?}. Fallback auf Simple.", std::env::var("PROMPT_TPL"));
-        tpl = ChatTpl::Simple;
+    
+    match which.as_str() {
+        "transformers" => {
+            let m = model::TransformerModel::from_safetensors(&s_weights, &s_config, dt)?;
+            Ok(Box::new(m))
+        }
+        // candle (Default)
+        _ => {
+            let m = models_candle::CandleLlamaModel::from_safetensors(&s_weights, &s_config, dt)?;
+            Ok(Box::new(m))
+        }
     }
+}
 
-    println!(
-        "Hinweis: PROMPT_TPL=simple|inst|chatml|im|llama3|gemma|turn|alpaca|vicuna (ENV) wählbar."
-    );
+// ---------------- Streaming-Helfer: stabiler UTF-8-Ausdruck ----------------
 
-    // 6) Sampling-Parameter (ENV überschreibbar)
-    let d_temperature: f32 = env_f32("TEMP", 0.8);
-    let i_top_k: usize = env_usize("TOP_K", 20);
-    let d_top_p: f32 = env_f32("TOP_P", 0.90);
-    let i_max_new: usize = env_usize("MAX_NEW", 200);
-    let mut rng = SimpleRng::new(env_u64("SEED", 0x1234_5678));
+fn common_prefix_bytes(a: &str, b: &str) -> usize {
+    // vergleicht nach chars -> erzeugt gültige Byte-Grenzen für UTF-8
+    let mut n = 0usize;
+    for (ca, cb) in a.chars().zip(b.chars()) {
+        if ca == cb {
+            n += ca.len_utf8();
+        } else {
+            break;
+        }
+    }
+    n
+}
 
-    println!("Frage das Modell. Eingabe 'exit' zum Beenden.");
-    println!(
-        "Nutze Sampling: temp={}, top_k={}, top_p={}",
-        d_temperature, i_top_k, d_top_p
-    );
-    println!("Hinweis: PROMPT_TPL=simple|inst|chatml|im (ENV) wählbar.");  
+// ---------------- Chat-Loop ----------------
 
-    // 7) Interaktive Schleife
+fn chat_loop(
+    tok: tokenizer::GgufTokenizer,
+    mut ctx_ids: Vec<u32>,
+    mut mdl: Box<dyn LmBackend>,
+    d_temp: f32,
+    i_max_new: usize,
+    i_topk: usize,
+    d_topp: f32,
+    d_minp: f32,
+    d_rep_pen: f32,
+    i_rep_win: usize,
+    v_stop_ids: Vec<Vec<u32>>,
+    fmt: ChatTemplate,
+) -> Result<(), String> {
+    println!("Chat gestartet. Tippe exit zum Beenden.");
+
+    let mut rng_state: u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64 ^ 0xC0FFEE_BAAD_F00D_u64)
+        .unwrap_or(0x1234_5678_9ABC_DEF0_u64);
+
+    let _i_max_stop = max_stop_len(&v_stop_ids);
     let mut s_input = String::new();
+
     loop {
         print!("> ");
         io::stdout().flush().map_err(|e| e.to_string())?;
@@ -394,89 +369,245 @@ fn main() -> Result<(), String> {
         io::stdin()
             .read_line(&mut s_input)
             .map_err(|e| e.to_string())?;
-
-        let s_line: &str = s_input.trim();
+        let s_line = s_input.trim();
         if s_line.eq_ignore_ascii_case("exit") {
+            println!("Tschuess");
             break;
         }
         if s_line.is_empty() {
             continue;
         }
 
-        // System-Text aus ENV oder Default
-        let s_system = std::env::var("SYSTEM_PROMPT")
-            .unwrap_or_else(|_| "You are a helpful assistent.".to_string());
-
-        // Prompt bauen
-        let s_prompt = build_prompt(tpl, &s_system, s_line);
-        println!(
-            "dbg prompt (first 200): {}",
-            visible_token(&s_prompt.chars().take(200).collect::<String>())
-        );
-
-        // ENCODE: add_special = false (wir steuern BOS bei Simple selbst)
-        let mut ids: Vec<usize> = tok
-            .encode(&s_prompt, false)
-            .map_err(|e| format!("encode fehlgeschlagen: {}", e))?;
-
-        // Bei Simple ggf. BOS einfügen
-        if matches!(tpl, ChatTpl::Simple) {
+        // Benutzer-Zugabe in den Kontext einbetten
+        if ctx_ids.is_empty() {
             if let Some(bos) = tok.bos_id() {
-                if ids.first().copied() != Some(bos) {
-                    ids.insert(0, bos);
-                }
+                ctx_ids.push(bos);
+            }
+            let s_sys = std::env::var("SYSTEM_PROMPT")
+                .unwrap_or_else(|_| "You are a helpful assistant.".to_string());
+            let s_first = build_first_turn(fmt, &tok, Some(&s_sys), s_line);
+            let ids = tok.encode(&s_first, false)?;
+            ctx_ids.extend_from_slice(&ids);
+
+            if debug_on() {
+                println!(
+                    "[DBG] first turn: template={:?}, sys_len={}, user_len={}",
+                    fmt,
+                    s_sys.len(),
+                    s_line.len()
+                );
+                println!("[DBG] ctx_len_after_first = {}", ctx_ids.len());
+            }
+        } else {
+            let s_next = build_next_turn(fmt, s_line);
+            let ids = tok.encode(&s_next, false)?;
+            ctx_ids.extend_from_slice(&ids);
+            if debug_on() {
+                println!("[DBG] appended next turn, ctx_len = {}", ctx_ids.len());
             }
         }
 
-        // KV-Cache zurücksetzen
-        model.reset_kv_cache();
+        let mut pending: Vec<u32> = Vec::new();
+        let mut printed_any = false;
+        let mut s_printed = String::new(); // stabiler Streaming-Puffer
 
-        // Prompt vorwärts laufen
-        let mut logits: Vec<f32> = Vec::new();
-        for (pos, &tid) in ids.iter().enumerate() {
-            logits = model.forward_next(tid, pos)?;
+        if debug_on() {
+            println!("[DBG] generation start: ctx_len = {}", ctx_ids.len());
         }
 
-        // Debug: Top-5 Logits
-        let mut pairs: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
-        pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        for (i, (id, logit)) in pairs.iter().take(10).enumerate() {
-            let tok_str = tok.decode(&[*id], true).unwrap_or_default();
-            println!("#{i} id={id} tok={:?} logit={:.4}", tok_str, logit);
-        }
+        for step in 0..i_max_new {
+            // Repetition window
+            let start = ctx_ids.len().saturating_sub(i_rep_win);
+            let v_recent = &ctx_ids[start..];
 
-        // Generierung: nur neues Suffix drucken
-        let mut gen_ids: Vec<usize> = Vec::new();
-        let mut s_out_prev = String::new();
+            // Logits
+            let v_logits = mdl.forward_tokens(&ctx_ids)?;
+            let next_idx = if (d_topp > 0.0 && d_topp <= 1.0) || d_minp > 0.0 || d_rep_pen > 1.0 {
+                model::sample_topk_topp_minp_with_repeat(
+                    &v_logits,
+                    d_temp,
+                    i_topk,
+                    d_topp,
+                    d_minp,
+                    v_recent,
+                    d_rep_pen,
+                    &mut rng_state,
+                ) as u32
+            } else if i_topk > 0 {
+                model::sample_topk(&v_logits, d_temp, i_topk, &mut rng_state) as u32
+            } else {
+                pick_top1(&v_logits, d_temp) as u32
+            };
 
-        for _ in 0..i_max_new {
-            let next_id =
-                sample_top_k_top_p_temperature(&logits, d_temperature, i_top_k, d_top_p, &mut rng);
-            ids.push(next_id);
-            gen_ids.push(next_id);
+            ctx_ids.push(next_idx);
+            pending.push(next_idx);
 
-            let pos = ids.len() - 1;
-            logits = model.forward_next(next_id, pos)?;
+            // Stop-IDs prüfen (vollständige Sequenz am Ende)
+            let mut hit_stop = false;
+            let mut stop_n = 0usize;
+            'stopcheck: for seq in &v_stop_ids {
+                let n = seq.len();
+                if n == 0 || ctx_ids.len() < n {
+                    continue;
+                }
+                let tail = &ctx_ids[ctx_ids.len() - n..];
+                if tail == seq.as_slice() {
+                    stop_n = n;
+                    hit_stop = true;
+                    break 'stopcheck;
+                }
+            }
 
-            if let Ok(s_all) = tok.decode(&gen_ids, true) {
-                if s_all.len() >= s_out_prev.len() {
-                    let tail = s_all.get(s_out_prev.len()..).unwrap_or("");
-                    if !tail.is_empty() {
-                        print!("{}", tail);
-                        io::stdout().flush().map_err(|e| e.to_string())?;
+            if hit_stop {
+                // Nur sicheren Teil (ohne Stop-Sequenz) ausgeben:
+                if pending.len() > stop_n {
+                    let safe = &pending[..pending.len() - stop_n];
+                    if !safe.is_empty() {
+                        let rest = tok.decode(safe, true).unwrap_or_default();
+                        let i_cp = common_prefix_bytes(&s_printed, &rest);
+                        let new_bytes = &rest.as_bytes()[i_cp..];
+                        if !new_bytes.is_empty() {
+                            if let Ok(new_str) = std::str::from_utf8(new_bytes) {
+                                print!("{}", new_str);
+                                io::stdout().flush().map_err(|e| e.to_string())?;
+                                printed_any = true;
+                            }
+                        }
                     }
-                    s_out_prev = s_all;
                 }
+                pending.clear();
+                s_printed.clear();
+                println!();
+                println!();
+                if debug_on() {
+                    println!(
+                        "[DBG] stop hit at step {}, ctx_len = {}",
+                        step,
+                        ctx_ids.len()
+                    );
+                }
+                break;
             }
 
+            // Streaming stabil: gesamte Pending decodieren, nur neuen Suffix drucken
+            let s_all = tok.decode(&pending, true).unwrap_or_default();
+            let i_cp = common_prefix_bytes(&s_printed, &s_all);
+            let new_bytes = &s_all.as_bytes()[i_cp..];
+            if !new_bytes.is_empty() {
+                if let Ok(new_str) = std::str::from_utf8(new_bytes) {
+                    print!("{}", new_str);
+                    io::stdout().flush().map_err(|e| e.to_string())?;
+                    printed_any = true;
+                }
+            }
+            s_printed = s_all;
+
+            // EOS?
             if let Some(eos) = tok.eos_id() {
-                if next_id == eos {
+                if next_idx == eos {
+                    // Rest final ausgeben (falls noch nicht gezeigt)
+                    if !pending.is_empty() {
+                        let rest = tok.decode(&pending, true).unwrap_or_default();
+                        let i_cp = common_prefix_bytes(&s_printed, &rest);
+                        let new_bytes = &rest.as_bytes()[i_cp..];
+                        if !new_bytes.is_empty() {
+                            if let Ok(new_str) = std::str::from_utf8(new_bytes) {
+                                print!("{}", new_str);
+                                io::stdout().flush().map_err(|e| e.to_string())?;
+                            }
+                        }
+                        pending.clear();
+                        s_printed.clear();
+                    }
+                    println!();
+                    println!();
+                    if debug_on() {
+                        println!(
+                            "[DBG] eos reached at step {}, ctx_len = {}",
+                            step,
+                            ctx_ids.len()
+                        );
+                    }
                     break;
                 }
             }
+        }
+
+        // Falls kein Stop/EOS ausgelöst, eventuell verbliebene Ausgabe zeigen
+        if !pending.is_empty() {
+            let rest = tok.decode(&pending, true).unwrap_or_default();
+            let i_cp = common_prefix_bytes(&s_printed, &rest);
+            let new_bytes = &rest.as_bytes()[i_cp..];
+            if !new_bytes.is_empty() {
+                if let Ok(new_str) = std::str::from_utf8(new_bytes) {
+                    print!("{}", new_str);
+                    io::stdout().flush().map_err(|e| e.to_string())?;
+                }
+            }
+            pending.clear();
+            s_printed.clear();
+        }
+        if !printed_any {
+            println!("[kein Token erzeugt]");
         }
         println!();
     }
 
     Ok(())
+}
+
+// ---------------- main ----------------
+
+fn main() -> Result<(), String> {
+    // Erforderlich: Weights, Config, Tokenizer
+    let s_tok_json = std::env::var("TOKENIZER_JSON")
+        .map_err(|_| "Bitte TOKENIZER_JSON auf tokenizer.json setzen".to_string())?;
+    let o_tok = tokenizer::load_tokenizer_from_json_force(&s_tok_json)
+        .map_err(|e| format!("Tokenizer-Load Fehler: {}", e))?;
+
+    // Sampling
+    let d_temperature = env_f32("TEMP", 0.8);
+    let i_max_new = env_usize("MAX_NEW", 64);
+    let i_topk = env_usize("TOPK", 40);
+    let d_topp = env_f32("TOPP", 0.9);
+    let d_minp = env_f32("MINP", 0.0);
+    let d_rep_pen = env_f32("REP_PENALTY", 1.1);
+    let i_rep_win = env_usize("REP_WINDOW", 256);
+
+    // Backend
+    let mut o_backend = build_backend()?;
+    println!("Vokabular (Backend): {}", o_backend.vocab_size());
+
+    // Template + Stops
+    let e_fmt = detect_chat_template(&o_tok);
+    let v_stop_str = env_or_default_stops(&o_tok, e_fmt);
+    let v_stop_ids = compile_stop_id_sequences(&o_tok, &v_stop_str);
+
+    if debug_on() {
+        println!("[CHK] BOS={:?} | EOS={:?}", o_tok.bos_id(), o_tok.eos_id());
+        let stop_raw = std::env::var("STOP").unwrap_or_else(|_| "".to_string());
+        println!("[CHK] STOP strings = {}", stop_raw);
+        println!("[CHK] DETECTED_TEMPLATE = {:?}", e_fmt);
+    }
+
+    println!(
+        "Temperature = {}, Max New = {}, Top-k = {}, Top-p = {}, Min-p = {}, RepPenalty = {}, RepWindow = {}, Stop = {:?}, Template = {:?}",
+        d_temperature, i_max_new, i_topk, d_topp, d_minp, d_rep_pen, i_rep_win, v_stop_str, e_fmt
+    );
+
+    // Chat
+    chat_loop(
+        o_tok,
+        Vec::new(),
+        o_backend,
+        d_temperature,
+        i_max_new,
+        i_topk,
+        d_topp,
+        d_minp,
+        d_rep_pen,
+        i_rep_win,
+        v_stop_ids,
+        e_fmt,
+    )
 }

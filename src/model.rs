@@ -1,1014 +1,1017 @@
-// model.rs
-// Zweck: Alles, was das Modell repraesentiert
-//  - Konfiguration aus GGUF laden (build_config, robust fuer mehrere Architekturen)
-//  - Gewichte aus GGUF in das interne Modell abbilden (map_all_weights)
-//  - Hilfsfunktionen fuer das sichere Umordnen von ggml-Matrizen
-//  - Schaltbare Debug-Ausgaben
+// models.rs
+// ------------------------------------------------------------
+// Transformer Modell (CPU) ohne GGUF
+// - Lädt HuggingFace Llama Gewichte aus safetensors + config.json
+// - Forward: Embedding -> N x [RMSNorm + MHA(GQA, RoPE) + Residual
+//            + RMSNorm + SwiGLU-MLP + Residual]
+// - Liefert Logits des letzten Tokens (Vec<f32>)
+//
 // Autor: Marcus Schlieper, ExpChat.ai
-// Datum: 2025-12-08
-// Sicherheit: kein unsafe, durchgehende Fehlerbehandlung
+// Kontakt: 49 2338 8748862 | 49 15115751864 | mschlieper@ylook.de
+// Firma: ExpChat.ai – Der KI Chat Client für den Mittelstand aus Breckerfeld
+// Zusatz: RPA, KI Agents, KI Internet Research, KI Wissensmanagement
+// Adresse: Epscheider Str21, 58339 Breckerfeld
+//
+// Stand: 2025-12-23
+// Lizenz: MIT / Apache-2.0
+//
+// Sicherheit:
+// - Kein unsafe
+// - Klare Result-Fehler
+// - Defensive Checks (Dtypen, Dimensionen, Masken)
+//
+// Hinweise:
+// - BACKEND="transformers" nutzt dieses Modell
+// - Datentyp per LLAMA_DTYPE: "f32" (Standard) oder "f16"
+// - Für stabile Ausgabe: passendes Prompt-Template (z. B. Llama3) und Stop-Token
+// ------------------------------------------------------------
 
-use crate::gguf_loader::{GgufModel, GgufTensor, GgufValue};
-use crate::layer::{Linear, ModelConfig, TransformerModel};
-use std::sync::atomic::{AtomicBool, Ordering};
+use candle::{DType, Device, Tensor};
+use candle_nn::ops as nn_ops;
+use safetensors::{tensor::TensorView, Dtype, SafeTensors};
+use serde::Deserialize;
 
-pub static DEBUG_ENABLED: AtomicBool = AtomicBool::new(false);
-
-pub fn set_debug(enabled: bool) {
-    DEBUG_ENABLED.store(enabled, Ordering::Relaxed);
+// ------------------------------------------------------------
+// Debug per ENV: DEBUG_MODEL != "0"
+// ------------------------------------------------------------
+fn debug_on() -> bool {
+    matches!(std::env::var("DEBUG_MODEL"), Ok(s) if s != "0")
 }
 
-pub fn init_debug_from_env() {
-    let on = std::env::var("MODEL_DEBUG")
-        .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    set_debug(on);
+// ------------------------------------------------------------
+// Hilfen: Dims, Ausrichtung, beste Teiler
+// ------------------------------------------------------------
+fn tensor_dims_2d(t: &Tensor) -> Result<(usize, usize), String> {
+    t.dims2().map_err(|e| e.to_string())
 }
 
-macro_rules! mdl_dbg {
-    ($($arg:tt)*) => {
-        if $crate::model::DEBUG_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
-            println!($($arg)*);
-        }
-    }
-}
-
-pub fn mean_abs(v_vals: &[f32]) -> f32 {
-    if v_vals.is_empty() {
-        return 0.0;
-    }
-    let mut d_sum = 0.0;
-    for &x in v_vals {
-        d_sum += x.abs();
-    }
-    d_sum / (v_vals.len() as f32)
-}
-
-// ============ Hilfsfunktionen: robustes Key-Lesen ============
-
-fn kv_u32_any(kv: &std::collections::HashMap<String, GgufValue>, keys: &[String]) -> Option<u32> {
-    for k in keys {
-        match kv.get(k) {
-            Some(GgufValue::U32(v)) => return Some(*v),
-            Some(GgufValue::U64(v)) => return Some(*v as u32),
-            Some(GgufValue::I32(v)) => return Some((*v).max(0) as u32),
-            Some(GgufValue::I64(v)) => return Some((*v).max(0) as u32),
-            _ => {}
-        }
-    }
-    None
-}
-
-fn kv_f32_any(kv: &std::collections::HashMap<String, GgufValue>, keys: &[String]) -> Option<f32> {
-    for k in keys {
-        match kv.get(k) {
-            Some(GgufValue::F32(v)) => return Some(*v),
-            Some(GgufValue::F64(v)) => return Some(*v as f32),
-            Some(GgufValue::U32(v)) => return Some(*v as f32),
-            Some(GgufValue::U64(v)) => return Some(*v as f32),
-            Some(GgufValue::I32(v)) => return Some(*v as f32),
-            Some(GgufValue::I64(v)) => return Some(*v as f32),
-            _ => {}
-        }
-    }
-    None
-}
-
-fn arch_keys(arch: &str, base: &str) -> Vec<String> {
-    // Liefert Prioritätenliste: arch.base, base, llama.base (fallback)
-    vec![
-        format!("{}.{}", arch, base),
-        base.to_string(),
-        format!("llama.{}", base),
-    ]
-}
-
-fn many_arch_aliases(arch: &str, bases: &[&str]) -> Vec<String> {
-    // baut fuer jede basis die drei Varianten wie oben
-    let mut out = Vec::new();
-    for b in bases {
-        out.push(format!("{}.{}", arch, b));
-        out.push((*b).to_string());
-        out.push(format!("llama.{}", b));
-    }
-    out
-}
-
-fn find_tensor<'a>(
-    m: &'a std::collections::HashMap<String, GgufTensor>,
-    names: &[&str],
-) -> Option<&'a GgufTensor> {
-    for n in names {
-        if let Some(t) = m.get(*n) {
-            return Some(t);
-        }
-    }
-    None
-}
-
-// ============ GGML -> Row-Major Mapping mit strengen Checks ============
-
-fn map_ggml_2d_to_rowmajor_labeled(
-    label: &str,
-    v_dst: &mut [f32],
-    i_rows: usize,
-    i_cols: usize,
-    v_src: &[f32],
-    i_ne0: usize,
-    i_ne1: usize,
-) -> Result<(), String> {
-    let i_dst_need = i_rows
-        .checked_mul(i_cols)
-        .ok_or_else(|| "dst size overflow".to_string())?;
-    let i_src_have = i_ne0
-        .checked_mul(i_ne1)
-        .ok_or_else(|| "src size overflow".to_string())?;
-    if v_dst.len() != i_dst_need {
-        return Err(format!(
-            "dst len mismatch: {} != {}",
-            v_dst.len(),
-            i_dst_need
-        ));
-    }
-    if v_src.len() != i_src_have {
-        return Err(format!(
-            "src len mismatch: {} != {}",
-            v_src.len(),
-            i_src_have
-        ));
-    }
-
-    // Branch A: gleiche Orientierung (ggml rows = ne1, cols = ne0)
-    if i_ne1 == i_rows && i_ne0 == i_cols {
-        mdl_dbg!(
-            "map {}: A (no transpose) rows={} cols={} ne0={} ne1={}",
-            label,
-            i_rows,
-            i_cols,
-            i_ne0,
-            i_ne1
-        );
-        for r in 0..i_rows {
-            for c in 0..i_cols {
-                let src_idx = c + r * i_ne0;
-                let dst_idx = r * i_cols + c;
-                v_dst[dst_idx] = v_src[src_idx];
-            }
-        }
-        return Ok(());
-    }
-
-    // Branch B: transponiert gespeichert
-    if i_ne1 == i_cols && i_ne0 == i_rows {
-        mdl_dbg!(
-            "map {}: B (transpose) rows={} cols={} ne0={} ne1={}",
-            label,
-            i_rows,
-            i_cols,
-            i_ne0,
-            i_ne1
-        );
-        for r in 0..i_rows {
-            for c in 0..i_cols {
-                let src_r = c;
-                let src_c = r;
-                let src_idx = src_c + src_r * i_ne0;
-                let dst_idx = r * i_cols + c;
-                v_dst[dst_idx] = v_src[src_idx];
-            }
-        }
-        return Ok(());
-    }
-
-    Err(format!(
-        "unerwartete ggml shape: (ne0={}, ne1={}) passt nicht zu (rows={}, cols={})",
-        i_ne0, i_ne1, i_rows, i_cols
-    ))
-}
-
-fn ensure_linear_shape_or_err(
-    in_dim: usize,
-    out_dim: usize,
-    ne0: usize,
-    ne1: usize,
-    name: &str,
-) -> Result<(), String> {
-    let ok = (ne1 == in_dim && ne0 == out_dim) || (ne1 == out_dim && ne0 == in_dim);
-    if ok {
-        Ok(())
+// Für x[T, in_dim].matmul(W) soll W => [in_dim, out_dim] sein.
+// HF Linear-Gewichte sind oft [out, in]; ggf. transponieren.
+fn orient_for_right_matmul(w: &Tensor, in_dim: usize) -> Result<Tensor, String> {
+    let (a, b) = tensor_dims_2d(w)?;
+    if a == in_dim {
+        Ok(w.clone())
+    } else if b == in_dim {
+        w.t().map_err(|e| e.to_string())
     } else {
         Err(format!(
-            "linear '{}' unexpected shape src=({}x{}), dst=({}x{})",
-            name, ne1, ne0, in_dim, out_dim
+            "Gewicht passt nicht zu in_dim {} ({} x {})",
+            in_dim, a, b
         ))
     }
 }
 
-fn set_linear_weight_from_tensor(o_lin: &mut Linear, o_t: &GgufTensor) -> Result<(), String> {
-    if o_t.shape.len() != 2 {
-        return Err("tensor shape not 2D".to_string());
+// Fallback-Teiler (für head_dim)
+fn best_divisor(total: usize, prefer: usize) -> usize {
+    if prefer > 0 && total % prefer == 0 {
+        return prefer;
     }
-    let v_data = o_t.to_f32_vec()?;
-    let i_ne0 = o_t.shape[0];
-    let i_ne1 = o_t.shape[1];
-
-    ensure_linear_shape_or_err(o_lin.in_dim, o_lin.out_dim, i_ne0, i_ne1, &o_t.name)?;
-
-    mdl_dbg!(
-        "map linear {}: src=({}x{}), dst=({}x{}), type={}",
-        o_t.name,
-        i_ne1,
-        i_ne0,
-        o_lin.in_dim,
-        o_lin.out_dim,
-        o_t.type_code
-    );
-
-    map_ggml_2d_to_rowmajor_labeled(
-        &o_t.name,
-        &mut o_lin.w,
-        o_lin.in_dim,
-        o_lin.out_dim,
-        &v_data,
-        i_ne0,
-        i_ne1,
-    )
-}
-
-fn set_vector_from_tensor(v_dst: &mut [f32], o_t: &GgufTensor) -> Result<(), String> {
-    let v_data = o_t.to_f32_vec()?;
-    if v_data.len() != v_dst.len() {
-        return Err(format!(
-            "vector len mismatch: {} != {}",
-            v_data.len(),
-            v_dst.len()
-        ));
+    let mut d = prefer.max(1);
+    while d > 1 {
+        if total % d == 0 {
+            return d;
+        }
+        d -= 1;
     }
-    mdl_dbg!(
-        "map vector {}: len={} type={}",
-        o_t.name,
-        v_data.len(),
-        o_t.type_code
-    );
-    v_dst.copy_from_slice(&v_data);
-    Ok(())
-}
-
-fn set_bias_from_tensor(v_dst: &mut [f32], o_t: &GgufTensor) -> Result<(), String> {
-    let v_data = o_t.to_f32_vec()?;
-    if v_data.len() != v_dst.len() {
-        return Err(format!(
-            "bias len mismatch: {} != {}",
-            v_data.len(),
-            v_dst.len()
-        ));
-    }
-    mdl_dbg!(
-        "map bias {}: len={} type={}",
-        o_t.name,
-        v_data.len(),
-        o_t.type_code
-    );
-    v_dst.copy_from_slice(&v_data);
-    Ok(())
-}
-
-fn tie_lm_head_from_tok_emb(o_model: &mut TransformerModel) {
-    let h = o_model.cfg.hidden_size;
-    let v = o_model.cfg.vocab_size;
-    mdl_dbg!(
-        "lm_head: tie from tok_emb (transpose) with hidden={}, vocab={}",
-        h,
-        v
-    );
-    for i_h in 0..h {
-        for i_v in 0..v {
-            o_model.lm_head[i_h * v + i_v] = o_model.tok_emb[i_v * h + i_h];
+    for d2 in (1..=total).rev() {
+        if total % d2 == 0 {
+            return d2;
         }
     }
+    1
 }
 
-// ============ Build Config: erweiterte Keys und Aliase ============
+// ------------------------------------------------------------
+// DType-Utilities
+// ------------------------------------------------------------
+fn to_dtype_if_needed(t: Tensor, dtype: DType) -> Result<Tensor, String> {
+    if t.dtype() == dtype {
+        Ok(t)
+    } else {
+        t.to_dtype(dtype).map_err(|e| e.to_string())
+    }
+}
 
-pub fn build_config(o_gguf: &GgufModel) -> ModelConfig {
-    let s_arch = o_gguf
-        .get_kv_str("general.architecture")
-        .unwrap_or_else(|| "llama".to_string())
-        .to_lowercase();
+// ------------------------------------------------------------
+// RoPE: Tabellen und Anwendung (voll / partiell)
+// ------------------------------------------------------------
+fn build_rope_cos_sin(
+    dev: &Device,
+    seq_len: usize,
+    rope_dim: usize,
+    rope_base: f32,
+    dtype: DType,
+) -> Result<(Tensor, Tensor), String> {
+    let half = rope_dim / 2;
+    if rope_dim == 0 || half == 0 {
+        return Err("rope_dim zu klein für RoPE".to_string());
+    }
+    let dim_idx_v: Vec<f32> = (0..half).map(|i| i as f32).collect();
+    let dim_idx = Tensor::from_vec(dim_idx_v, half, dev).map_err(|e| e.to_string())?;
 
-    // Vokab
-    let mut i_vocab_size = o_gguf
-        .get_kv_u32("tokenizer.vocab_size")
-        .map(|v| v as usize)
-        .unwrap_or(0);
-    if i_vocab_size == 0 {
-        if let Some(GgufValue::ArrStr(v)) = o_gguf.kv.get("tokenizer.ggml.tokens") {
-            i_vocab_size = v.len();
+    let pos_v: Vec<f32> = (0..seq_len).map(|p| p as f32).collect();
+    let pos = Tensor::from_vec(pos_v, seq_len, dev).map_err(|e| e.to_string())?;
+    let pos = pos.unsqueeze(1).map_err(|e| e.to_string())?; // [T,1]
+
+    let ln_base = rope_base.ln();
+    let scale = -2.0f32 / (rope_dim as f32);
+    let inv_log = dim_idx
+        .broadcast_mul(&Tensor::new(scale * ln_base, dev).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    let inv_freq = inv_log.exp().map_err(|e| e.to_string())?; // [half]
+    let inv_freq = inv_freq.unsqueeze(0).map_err(|e| e.to_string())?; // [1,half]
+
+    let angles = pos.broadcast_mul(&inv_freq).map_err(|e| e.to_string())?; // [T,half]
+    let cos = angles.cos().map_err(|e| e.to_string())?;
+    let sin = angles.sin().map_err(|e| e.to_string())?;
+
+    let cos = to_dtype_if_needed(cos, dtype)?;
+    let sin = to_dtype_if_needed(sin, dtype)?;
+    Ok((cos, sin))
+}
+
+fn apply_rope_full(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor, String> {
+    let (_t, d) = x.dims2().map_err(|e| e.to_string())?;
+    if d % 2 != 0 {
+        return Err("head_dim für RoPE muss gerade sein".to_string());
+    }
+    let half = d / 2;
+    let x0 = x.narrow(1, 0, half).map_err(|e| e.to_string())?;
+    let x1 = x.narrow(1, half, half).map_err(|e| e.to_string())?;
+    let y0 = x0
+        .broadcast_mul(cos)
+        .map_err(|e| e.to_string())?
+        .broadcast_sub(&x1.broadcast_mul(sin).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    let y1 = x0
+        .broadcast_mul(sin)
+        .map_err(|e| e.to_string())?
+        .broadcast_add(&x1.broadcast_mul(cos).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    Tensor::cat(&[y0, y1], 1).map_err(|e| e.to_string())
+}
+
+fn apply_rope_partial(
+    x: &Tensor,
+    cos: &Tensor,
+    sin: &Tensor,
+    rope_dim: usize,
+) -> Result<Tensor, String> {
+    let (_t, d) = x.dims2().map_err(|e| e.to_string())?;
+    if rope_dim == d {
+        return apply_rope_full(x, cos, sin);
+    }
+    if rope_dim == 0 || rope_dim > d {
+        return Err(format!(
+            "ungueltiger rope_dim: {}, gesamt_dim: {}",
+            rope_dim, d
+        ));
+    }
+    let x_rot = x.narrow(1, 0, rope_dim).map_err(|e| e.to_string())?;
+    let x_pas = x
+        .narrow(1, rope_dim, d - rope_dim)
+        .map_err(|e| e.to_string())?;
+    let y_rot = apply_rope_full(&x_rot, cos, sin)?;
+    Tensor::cat(&[y_rot, x_pas], 1).map_err(|e| e.to_string())
+}
+
+// ------------------------------------------------------------
+// RMSNorm und kausale Maske
+// ------------------------------------------------------------
+pub fn rms_norm(x: &Tensor, w: &Tensor, eps: f32) -> Result<Tensor, String> {
+    let (_t, h) = x.dims2().map_err(|e| e.to_string())?;
+    let dtype = x.dtype();
+
+    let x2 = x.broadcast_mul(x).map_err(|e| e.to_string())?;
+    let sum = x2.sum_keepdim(1).map_err(|e| e.to_string())?;
+    let h_t = Tensor::new(h as f32, x.device())
+        .map_err(|e| e.to_string())?
+        .to_dtype(dtype)
+        .map_err(|e| e.to_string())?;
+    let eps_t = Tensor::new(eps, x.device())
+        .map_err(|e| e.to_string())?
+        .to_dtype(dtype)
+        .map_err(|e| e.to_string())?;
+
+    let denom = sum
+        .broadcast_div(&h_t)
+        .map_err(|e| e.to_string())?
+        .broadcast_add(&eps_t)
+        .map_err(|e| e.to_string())?
+        .sqrt()
+        .map_err(|e| e.to_string())?;
+
+    let y = x.broadcast_div(&denom).map_err(|e| e.to_string())?;
+    let w2 = w.unsqueeze(0).map_err(|e| e.to_string())?;
+    y.broadcast_mul(&w2).map_err(|e| e.to_string())
+}
+
+pub fn causal_mask(dev: &Device, t: usize, dtype: DType) -> Result<Tensor, String> {
+    let mut v = vec![0f32; t * t];
+    for i in 0..t {
+        for j in (i + 1)..t {
+            v[i * t + j] = -1e9f32;
         }
     }
-    if i_vocab_size == 0 {
-        i_vocab_size = 32000;
-    }
+    let m = Tensor::from_vec(v, (t, t), dev).map_err(|e| e.to_string())?;
+    to_dtype_if_needed(m, dtype)
+}
 
-    // Embedding-Fallback (Form)
-    let emb_t = find_tensor(
-        &o_gguf.tensors,
-        &[
-            "tok_embeddings.weight",
-            "token_embd.weight",
-            "token_embeddings.weight",
-            "embed_tokens.weight",
-        ],
-    );
-    let (hidden_guess, vocab_guess) = if let Some(t) = emb_t {
-        if t.shape.len() == 2 {
-            (t.shape[0], t.shape[1])
+// ------------------------------------------------------------
+// Konvertierung F16/BF16 -> F32, Safetensors-Reader
+// ------------------------------------------------------------
+fn f16_to_f32_bits(h: u16) -> f32 {
+    let s = ((h >> 15) & 0x0001) as u32;
+    let e = ((h >> 10) & 0x001f) as u32;
+    let f = (h & 0x03ff) as u32;
+    let bits: u32 = if e == 0 {
+        if f == 0 {
+            s << 31
         } else {
-            (128usize, i_vocab_size)
+            // subnormal
+            let mut e32: i32 = 127 - 15 + 1;
+            let mut f32m = f;
+            while (f32m & 0x0400) == 0 {
+                f32m <<= 1;
+                e32 -= 1;
+            }
+            let f32m = f32m & 0x03ff;
+            (s << 31) | ((e32 as u32) << 23) | (f32m << 13)
+        }
+    } else if e == 31 {
+        if f == 0 {
+            (s << 31) | 0x7f800000
+        } else {
+            (s << 31) | 0x7f800000 | (f << 13)
         }
     } else {
-        (128usize, i_vocab_size)
+        let e32 = e + (127 - 15);
+        (s << 31) | (e32 << 23) | (f << 13)
     };
+    f32::from_le_bytes(bits.to_le_bytes())
+}
 
-    // Aliase pro Feld
-    let hidden_keys = {
-        let v = many_arch_aliases(&s_arch, &["embedding_length", "hidden_size"]);
-        v
-    };
-    let layers_keys = many_arch_aliases(&s_arch, &["block_count"]);
-    let heads_keys = {
-        let mut v = many_arch_aliases(&s_arch, &["attention.head_count", "num_attention_heads"]);
-        v.push("num_attention_heads".to_string());
-        v
-    };
-    let kv_heads_keys = {
-        let mut v = many_arch_aliases(&s_arch, &["attention.head_count_kv", "num_key_value_heads"]);
-        v.push("num_key_value_heads".to_string());
-        v
-    };
-    let ffn_keys = {
-        let mut v = many_arch_aliases(&s_arch, &["feed_forward_length", "intermediate_size"]);
-        v.push("intermediate_size".to_string());
-        v
-    };
-    let ctx_keys = {
-        let mut v = many_arch_aliases(&s_arch, &["context_length", "max_position_embeddings"]);
-        v.push("max_position_embeddings".to_string());
-        v
-    };
-    let rope_dim_keys = {
-        let mut v = many_arch_aliases(&s_arch, &["rope.dimension_count"]);
-        // weitere Aliase (NeoX)
-        v.push("attention.rotary_ndims".to_string());
-        v.push("gptneox.rope.dimension_count".to_string());
-        v
-    };
-    let rope_base_keys = {
-        // Bevorzugt theta, dann freq_base
-        let mut v = many_arch_aliases(&s_arch, &["rope.theta", "rope.freq_base"]);
-        v.push("rope.freq_base".to_string());
-        v
-    };
-    let rms_eps_keys = {
-        let v = vec![
-            "rms_norm_eps".to_string(),
-            format!("{}.rms_norm_eps", s_arch),
-            "attention.layer_norm_rms_epsilon".to_string(),
-            format!("{}.attention.layer_norm_rms_epsilon", s_arch),
-            "llama.rms_norm_eps".to_string(),
-        ];
-        v
-    };
+fn bf16_to_f32_bits(h: u16) -> f32 {
+    let bits: u32 = (h as u32) << 16;
+    f32::from_le_bytes(bits.to_le_bytes())
+}
 
-    let i_hidden_size = kv_u32_any(&o_gguf.kv, &hidden_keys)
-        .map(|v| v as usize)
-        .unwrap_or(hidden_guess);
-
-    let i_n_layers = kv_u32_any(&o_gguf.kv, &layers_keys)
-        .map(|v| v as usize)
-        .unwrap_or_else(|| {
-            let mut i = 0usize;
-            loop {
-                let p = format!("blk.{}", i);
-                let has = o_gguf.tensors.keys().any(|k| k.starts_with(&p));
-                if !has {
-                    break;
-                }
-                i += 1;
+fn read_view_to_f32_vec(tv: &TensorView) -> Result<Vec<f32>, String> {
+    let data = tv.data();
+    Ok(match tv.dtype() {
+        Dtype::F32 => {
+            let mut out = vec![0f32; data.len() / 4];
+            for (i, ch) in data.chunks_exact(4).enumerate() {
+                out[i] = f32::from_le_bytes([ch[0], ch[1], ch[2], ch[3]]);
             }
-            i.max(1)
-        });
+            out
+        }
+        Dtype::F16 => {
+            let mut out = vec![0f32; data.len() / 2];
+            for (i, ch) in data.chunks_exact(2).enumerate() {
+                let h = u16::from_le_bytes([ch[0], ch[1]]);
+                out[i] = f16_to_f32_bits(h);
+            }
+            out
+        }
+        Dtype::BF16 => {
+            let mut out = vec![0f32; data.len() / 2];
+            for (i, ch) in data.chunks_exact(2).enumerate() {
+                let h = u16::from_le_bytes([ch[0], ch[1]]);
+                out[i] = bf16_to_f32_bits(h);
+            }
+            out
+        }
+        other => return Err(format!("Nicht unterstützter Dtype: {:?}", other)),
+    })
+}
 
-    let i_n_heads = kv_u32_any(&o_gguf.kv, &heads_keys)
-        .map(|v| v as usize)
-        .unwrap_or((i_hidden_size / 64).max(1));
+fn load_2d(st: &SafeTensors, name: &str, dev: &Device) -> Result<Tensor, String> {
+    let tv = st.tensor(name).map_err(|e| format!("{}: {}", name, e))?;
+    let shape = tv.shape();
+    if shape.len() != 2 {
+        return Err(format!("{} ist nicht 2D (shape={:?})", name, shape));
+    }
+    let v = read_view_to_f32_vec(&tv)?;
+    let (a, b) = (shape[0], shape[1]);
+    Tensor::from_vec(v, (a, b), dev).map_err(|e| e.to_string())
+}
 
-    let mut i_n_kv_heads = kv_u32_any(&o_gguf.kv, &kv_heads_keys)
-        .map(|v| v as usize)
-        .unwrap_or(i_n_heads);
+fn load_1d(st: &SafeTensors, name: &str, dev: &Device) -> Result<Tensor, String> {
+    let tv = st.tensor(name).map_err(|e| format!("{}: {}", name, e))?;
+    let shape = tv.shape();
+    if shape.len() != 1 {
+        return Err(format!("{} ist nicht 1D (shape={:?})", name, shape));
+    }
+    let v = read_view_to_f32_vec(&tv)?;
+    let n = shape[0];
+    Tensor::from_vec(v, n, dev).map_err(|e| e.to_string())
+}
 
-    // Intermediate (FFN)
-    let i_intermediate_size = kv_u32_any(&o_gguf.kv, &ffn_keys)
-        .map(|v| v as usize)
-        .or_else(|| {
-            find_tensor(&o_gguf.tensors, &["blk.0.ffn_up.weight"]).and_then(|t| {
-                if t.shape.len() == 2 {
-                    Some(t.shape[1])
-                } else {
-                    None
-                }
-            })
-        })
-        .unwrap_or(i_hidden_size * 4);
-
-    let i_max_seq_len = kv_u32_any(&o_gguf.kv, &ctx_keys)
-        .map(|v| v as usize)
-        .unwrap_or(2048);
-
-    // Rope Dim, Default: head_dim
-    let i_head_dim = (i_hidden_size / i_n_heads.max(1)).max(1);
-    let i_rope_dim = kv_u32_any(&o_gguf.kv, &rope_dim_keys)
-        .map(|v| v as usize)
-        .unwrap_or(i_head_dim);
-
-    // Rope Base (theta)
-    let d_rope_base = if let Ok(s) = std::env::var("ROPE_THETA") {
-        s.parse::<f32>().unwrap_or_else(|_| {
-            kv_f32_any(&o_gguf.kv, &rope_base_keys).unwrap_or_else(|| {
-                if s_arch.starts_with("qwen") {
-                    1_000_000.0
-                } else {
-                    10000.0
-                }
-            })
-        })
-    } else {
-        kv_f32_any(&o_gguf.kv, &rope_base_keys).unwrap_or_else(|| {
-            if s_arch.starts_with("qwen") {
-                1_000_000.0
+fn try_load_lm_head(
+    st: &SafeTensors,
+    dev: &Device,
+    hidden: usize,
+    vocab: usize,
+) -> Result<Tensor, String> {
+    let cand = [
+        "lm_head.weight",
+        "model.lm_head.weight",
+        "output.weight",
+        "model.output.weight",
+    ];
+    for name in cand {
+        if let Ok(w) = load_2d(st, name, dev) {
+            let (a, b) = w.dims2().map_err(|e| e.to_string())?;
+            if a == hidden && b == vocab {
+                return Ok(w);
+            } else if a == vocab && b == hidden {
+                return w.t().map_err(|e| e.to_string());
             } else {
-                10000.0
+                let wt = w.t().map_err(|e| e.to_string())?;
+                let (aa, bb) = wt.dims2().map_err(|e| e.to_string())?;
+                if aa == hidden && bb == vocab {
+                    return Ok(wt);
+                }
             }
-        })
-    };
-
-    println!("Rope Base (theta)= {}", d_rope_base);
-    
-    // Rope Scaling
-    let rope_scaling_type = o_gguf
-        .get_kv_str("rope.scaling.type")
-        .or_else(|| o_gguf.get_kv_str(&format!("{}.rope.scaling.type", s_arch)));
-    let rope_scaling_factor = kv_f32_any(
-        &o_gguf.kv,
-        &vec![
-            format!("{}.rope.scaling.factor", s_arch),
-            "rope.scaling.factor".to_string(),
-        ],
-    );
-
-    // RMSNorm eps
-    let d_rms_eps = kv_f32_any(&o_gguf.kv, &rms_eps_keys).unwrap_or(1e-5);
-
-    mdl_dbg!("rms_norm_eps from GGUF = {}", d_rms_eps);
-    mdl_dbg!("rope_base (theta) from GGUF = {}", d_rope_base);
-
-    if let Some(ref t) = rope_scaling_type {
-        mdl_dbg!("rope.scaling.type = {}", t);
+        }
     }
-    if let Some(f) = rope_scaling_factor {
-        mdl_dbg!("rope.scaling.factor = {}", f);
-    }
+    Err("lm_head nicht gefunden".to_string())
+}
 
-    // GQA Plausibilitaet aus Gewichten pruefen und Heads ggf. korrigieren (nur Debug)
-    if let Some(tk) = o_gguf
-        .tensors
-        .get("blk.0.attn_k.weight")
-        .or_else(|| o_gguf.tensors.get("layers.0.self_attn.k_proj.weight"))
-        .or_else(|| o_gguf.tensors.get("layers.0.attention.wk.weight"))
-    {
-        let (ne0, ne1) = (tk.shape[0], tk.shape[1]);
-        let out_k = if ne1 == i_hidden_size {
-            ne0
-        } else if ne0 == i_hidden_size {
-            ne1
+// ------------------------------------------------------------
+// HF Llama Config (Auszug)
+// ------------------------------------------------------------
+#[derive(Debug, Deserialize)]
+struct HfLlamaConfig {
+    hidden_size: usize,
+    intermediate_size: usize,
+    num_hidden_layers: usize,
+    num_attention_heads: usize,
+    #[serde(default)]
+    num_key_value_heads: Option<usize>,
+    #[serde(default)]
+    vocab_size: usize,
+    #[serde(default)]
+    rms_norm_eps: Option<f32>,
+    #[serde(default)]
+    rope_theta: Option<f32>,
+    #[serde(default)]
+    tie_word_embeddings: Option<bool>,
+}
+
+// ------------------------------------------------------------
+// Layer-Gewichte und Modell
+// ------------------------------------------------------------
+struct LayerWeights {
+    // Attention Projektionen
+    w_q: Tensor, // [hidden, q_out]
+    w_k: Tensor, // [hidden, k_out]
+    w_v: Tensor, // [hidden, v_out]
+    w_o: Tensor, // Rohform; im Forward ggf. transponieren
+
+    // Normen
+    attn_norm_w: Tensor, // [hidden]
+    ffn_norm_w: Tensor,  // [hidden]
+
+    // MLP (SwiGLU)
+    w_gate: Tensor, // [hidden, inter]
+    w_up: Tensor,   // [hidden, inter]
+    w_down: Tensor, // [inter, hidden]
+}
+
+pub struct TransformerModel {
+    dev: Device,
+
+    // Größen
+    i_vocab_size: usize,
+    i_hidden_size: usize,
+    i_n_layers: usize,
+    i_n_heads_hint: usize,
+    i_n_kv_heads_hint: usize,
+
+    // RoPE
+    d_rope_base: f32,
+    i_rope_dim_hint: usize,
+
+    // Norm
+    d_rms_eps: f32,
+
+    // Aktiver DType des Modells
+    model_dtype: DType,
+
+    // Embeddings / Head
+    emb_vh: Tensor,     // [vocab, hidden] in model_dtype
+    lm_head_hv: Tensor, // [hidden, vocab] in model_dtype
+    output_norm_w: Option<Tensor>,
+
+    // Layer
+    layers: Vec<LayerWeights>,
+}
+
+// ------------------------------------------------------------
+// Konstruktor
+// ------------------------------------------------------------
+impl TransformerModel {
+    pub fn from_safetensors(
+        weights_path: &str,
+        config_json: &str,
+        dtype: DType,
+    ) -> Result<Self, String> {
+        let dev = Device::Cpu;
+
+        // Config laden
+        let cfg_bytes = std::fs::read(config_json)
+            .map_err(|e| format!("config.json lesen fehlgeschlagen: {}", e))?;
+        let cfg: HfLlamaConfig =
+            serde_json::from_slice(&cfg_bytes).map_err(|e| format!("config.json parse: {}", e))?;
+
+        let i_hidden = cfg.hidden_size;
+        let i_vocab = cfg.vocab_size;
+        let i_layers = cfg.num_hidden_layers;
+        let i_heads_hint = cfg.num_attention_heads.max(1);
+        let i_kv_heads = cfg.num_key_value_heads.unwrap_or(i_heads_hint).max(1);
+        let d_rope_base = cfg.rope_theta.unwrap_or(10000.0);
+        let i_rope_dim_hint = i_hidden / i_heads_hint;
+        let d_rms_eps = cfg.rms_norm_eps.unwrap_or(1e-5);
+
+        // Weights laden
+        let w_bytes = std::fs::read(weights_path)
+            .map_err(|e| format!("safetensors lesen fehlgeschlagen: {}", e))?;
+        let st = SafeTensors::deserialize(&w_bytes)
+            .map_err(|e| format!("safetensors parse fehlgeschlagen: {}", e))?;
+
+        if debug_on() {
+            let mut shown = 0usize;
+            for n in st.names() {
+                if n.contains("head") || n.contains("output") {
+                    if shown < 16 {
+                        println!("[DBG] key: {}", n);
+                    }
+                    shown += 1;
+                }
+            }
+            if shown > 16 {
+                println!("[DBG] ... {} weitere", shown - 16);
+            }
+        }
+
+        // Embedding f32 -> dtype
+        let emb_vh_f32 = load_2d(&st, "model.embed_tokens.weight", &dev)?;
+        let emb_vh = to_dtype_if_needed(emb_vh_f32.clone(), dtype)?;
+
+        // lm_head: try -> sonst Weight-Tying
+        let tying = cfg.tie_word_embeddings.unwrap_or(false);
+        let lm_head_hv_f32 = if tying {
+            if debug_on() {
+                println!("[INFO] tie_word_embeddings=true -> Weight Tying");
+            }
+            emb_vh_f32.t().map_err(|e| e.to_string())?
         } else {
-            0
+            match try_load_lm_head(&st, &dev, i_hidden, i_vocab) {
+                Ok(t) => t,
+                Err(_) => {
+                    if debug_on() {
+                        println!("[WARN] lm_head fehlt -> Weight Tying via embed_tokens");
+                    }
+                    emb_vh_f32.t().map_err(|e| e.to_string())?
+                }
+            }
         };
-        if out_k > 0 {
-            let kv_guess = (out_k / i_head_dim).max(1);
-            mdl_dbg!(
-                "dbg kv_heads: from weights = {}, from kv = {}",
-                kv_guess,
-                i_n_kv_heads
+        let lm_head_hv = to_dtype_if_needed(lm_head_hv_f32, dtype)?;
+
+        if debug_on() {
+            let (ev, eh) = emb_vh.dims2().map_err(|e| e.to_string())?;
+            let (lh, lv) = lm_head_hv.dims2().map_err(|e| e.to_string())?;
+            let emb_ok = ev == i_vocab && eh == i_hidden;
+            let head_ok = lh == i_hidden && lv == i_vocab;
+            println!(
+                "[CHK-EMB] emb_vh dims (vocab,hidden)=({},{}) expected=({},{}) -> {}",
+                ev,
+                eh,
+                i_vocab,
+                i_hidden,
+                if emb_ok { "OK" } else { "MISMATCH" }
             );
-            if std::env::var("FORCE_KV_HEADS")
-                .ok()
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false)
-            {
-                mdl_dbg!("FORCE_KV_HEADS=1 -> override kv_heads to {}", kv_guess);
-                i_n_kv_heads = kv_guess;
+            println!(
+                "[CHK-HEAD] lm_head_hv dims (hidden,vocab)=({},{}) expected=({},{}) -> {}",
+                lh,
+                lv,
+                i_hidden,
+                i_vocab,
+                if head_ok { "OK" } else { "MISMATCH" }
+            );
+        }
+
+        // optionale finale Norm
+        let output_norm_w = match st.tensor("model.norm.weight") {
+            Ok(_) => {
+                let w = load_1d(&st, "model.norm.weight", &dev)?;
+                Some(to_dtype_if_needed(w, dtype)?)
+            }
+            Err(_) => None,
+        };
+
+        // Layer
+        let mut layers: Vec<LayerWeights> = Vec::with_capacity(i_layers);
+        for l in 0..i_layers {
+            let pre = format!("model.layers.{}", l);
+
+            let w_q = to_dtype_if_needed(
+                orient_for_right_matmul(
+                    &load_2d(&st, &format!("{}.self_attn.q_proj.weight", pre), &dev)?,
+                    i_hidden,
+                )?,
+                dtype,
+            )?;
+            let w_k = to_dtype_if_needed(
+                orient_for_right_matmul(
+                    &load_2d(&st, &format!("{}.self_attn.k_proj.weight", pre), &dev)?,
+                    i_hidden,
+                )?,
+                dtype,
+            )?;
+            let w_v = to_dtype_if_needed(
+                orient_for_right_matmul(
+                    &load_2d(&st, &format!("{}.self_attn.v_proj.weight", pre), &dev)?,
+                    i_hidden,
+                )?,
+                dtype,
+            )?;
+            // o_proj Rohform (Transpose im Forward bei Bedarf)
+            let w_o = to_dtype_if_needed(
+                orient_for_right_matmul(
+                    &load_2d(&st, &format!("{}.self_attn.o_proj.weight", pre), &dev)?,
+                    i_hidden, // entspricht in Llama dem q_w
+                )?,
+                dtype,
+            )?;
+
+            let attn_norm_w = to_dtype_if_needed(
+                load_1d(&st, &format!("{}.input_layernorm.weight", pre), &dev)?,
+                dtype,
+            )?;
+            let ffn_norm_w = to_dtype_if_needed(
+                load_1d(
+                    &st,
+                    &format!("{}.post_attention_layernorm.weight", pre),
+                    &dev,
+                )?,
+                dtype,
+            )?;
+
+            let w_gate = to_dtype_if_needed(
+                orient_for_right_matmul(
+                    &load_2d(&st, &format!("{}.mlp.gate_proj.weight", pre), &dev)?,
+                    i_hidden,
+                )?,
+                dtype,
+            )?;
+            let w_up = to_dtype_if_needed(
+                orient_for_right_matmul(
+                    &load_2d(&st, &format!("{}.mlp.up_proj.weight", pre), &dev)?,
+                    i_hidden,
+                )?,
+                dtype,
+            )?;
+            let (_, inter_u) = w_up.dims2().map_err(|e| e.to_string())?;
+            let w_down = to_dtype_if_needed(
+                orient_for_right_matmul(
+                    &load_2d(&st, &format!("{}.mlp.down_proj.weight", pre), &dev)?,
+                    inter_u,
+                )?,
+                dtype,
+            )?;
+
+            if debug_on() && l == 0 {
+                let (q_in, q_out) = tensor_dims_2d(&w_q)?;
+                let (k_in, k_out) = tensor_dims_2d(&w_k)?;
+                let (v_in, v_out) = tensor_dims_2d(&w_v)?;
+                let (wo_a, wo_b) = tensor_dims_2d(&w_o)?;
+                println!(
+                    "[CHK-L0] Q=({},{}), K=({},{}), V=({},{}), O=({},{})",
+                    q_in, q_out, k_in, k_out, v_in, v_out, wo_a, wo_b
+                );
+            }
+
+            layers.push(LayerWeights {
+                w_q,
+                w_k,
+                w_v,
+                w_o,
+                attn_norm_w,
+                ffn_norm_w,
+                w_gate,
+                w_up,
+                w_down,
+            });
+        }
+
+        Ok(Self {
+            dev,
+            i_vocab_size: i_vocab,
+            i_hidden_size: i_hidden,
+            i_n_layers: i_layers,
+            i_n_heads_hint: i_heads_hint,
+            i_n_kv_heads_hint: i_kv_heads,
+            d_rope_base,
+            i_rope_dim_hint,
+            d_rms_eps,
+            model_dtype: dtype,
+            emb_vh,
+            lm_head_hv,
+            output_norm_w,
+            layers,
+        })
+    }
+
+    // --------------------------------------------------------
+    // Forward: Logits (letztes Token) als Vec<f32>
+    // --------------------------------------------------------
+    pub fn forward_tokens(&self, ids: &[u32]) -> Result<Vec<f32>, String> {
+        if ids.is_empty() {
+            return Err("forward_tokens: leere Eingabe".to_string());
+        }
+
+        // Embedding stapeln: [T, hidden] (bereits model_dtype)
+        let mut rows: Vec<Tensor> = Vec::with_capacity(ids.len());
+        for &tid in ids {
+            let i = tid as usize;
+            if i >= self.i_vocab_size {
+                return Err(format!(
+                    "Token-ID {} >= vocab_size {}",
+                    i, self.i_vocab_size
+                ));
+            }
+            let row = self
+                .emb_vh
+                .narrow(0, i, 1)
+                .map_err(|e| e.to_string())?
+                .squeeze(0)
+                .map_err(|e| e.to_string())?;
+            rows.push(row);
+        }
+        let mut x = Tensor::stack(&rows, 0).map_err(|e| e.to_string())?; // [T, hidden]
+        let t = ids.len();
+
+        // Maske (selber DType wie x)
+        let mask = causal_mask(&self.dev, t, x.dtype())?;
+
+        // Layer
+        for (_l_idx, lw) in self.layers.iter().enumerate() {
+            // Pre-Attention RMSNorm
+            let x_attn_in = rms_norm(&x, &lw.attn_norm_w, self.d_rms_eps)?;
+
+            // Proj
+            let q = x_attn_in.matmul(&lw.w_q).map_err(|e| e.to_string())?; // [T, q_w]
+            let k = x_attn_in.matmul(&lw.w_k).map_err(|e| e.to_string())?; // [T, k_w]
+            let v = x_attn_in.matmul(&lw.w_v).map_err(|e| e.to_string())?; // [T, v_w]
+            let (_tq, q_w) = tensor_dims_2d(&q)?;
+            let (_tk, k_w) = tensor_dims_2d(&k)?;
+            let (_tv, v_w) = tensor_dims_2d(&v)?;
+
+            // Head-Aufteilung
+            let base_head_dim = if self.i_n_heads_hint > 0 {
+                self.i_hidden_size / self.i_n_heads_hint
+            } else {
+                0
+            };
+            let head_dim = if base_head_dim > 0 && q_w % base_head_dim == 0 {
+                base_head_dim
+            } else {
+                best_divisor(q_w, base_head_dim.max(1))
+            };
+            if head_dim == 0 || q_w % head_dim != 0 || k_w % head_dim != 0 || v_w % head_dim != 0 {
+                return Err(format!(
+                    "Head-Aufteilung passt nicht: q={}, k={}, v={}, head_dim={}",
+                    q_w, k_w, v_w, head_dim
+                ));
+            }
+            let n_heads_eff = q_w / head_dim;
+            let n_kv_heads_eff = (k_w / head_dim).max(1);
+            if (v_w / head_dim).max(1) != n_kv_heads_eff {
+                return Err("k/v-Heads ungleich".to_string());
+            }
+
+            // in [heads, T, head_dim]
+            let q = q
+                .reshape((t, n_heads_eff, head_dim))
+                .map_err(|e| e.to_string())?
+                .transpose(0, 1)
+                .map_err(|e| e.to_string())?;
+            let k = k
+                .reshape((t, n_kv_heads_eff, head_dim))
+                .map_err(|e| e.to_string())?
+                .transpose(0, 1)
+                .map_err(|e| e.to_string())?;
+            let v = v
+                .reshape((t, n_kv_heads_eff, head_dim))
+                .map_err(|e| e.to_string())?
+                .transpose(0, 1)
+                .map_err(|e| e.to_string())?;
+
+            // RoPE
+            let rope_dim_eff = (self.i_rope_dim_hint.min(head_dim).max(2)) & !1;
+            let (cos, sin) =
+                build_rope_cos_sin(&self.dev, t, rope_dim_eff, self.d_rope_base, x.dtype())?;
+
+            // GQA: teile Q auf KV-Heads (mod)
+            let mut ctx_heads: Vec<Tensor> = Vec::with_capacity(n_heads_eff);
+            for h in 0..n_heads_eff {
+                let hk = h % n_kv_heads_eff;
+
+                let qh = q
+                    .narrow(0, h, 1)
+                    .map_err(|e| e.to_string())?
+                    .squeeze(0)
+                    .map_err(|e| e.to_string())?;
+                let kh = k
+                    .narrow(0, hk, 1)
+                    .map_err(|e| e.to_string())?
+                    .squeeze(0)
+                    .map_err(|e| e.to_string())?;
+                let vh = v
+                    .narrow(0, hk, 1)
+                    .map_err(|e| e.to_string())?
+                    .squeeze(0)
+                    .map_err(|e| e.to_string())?;
+
+                let qh = apply_rope_partial(&qh, &cos, &sin, rope_dim_eff)?;
+                let kh = apply_rope_partial(&kh, &cos, &sin, rope_dim_eff)?;
+
+                // scores [T,T]
+                let kt = kh.transpose(0, 1).map_err(|e| e.to_string())?;
+                let mut scores = qh.matmul(&kt).map_err(|e| e.to_string())?;
+                let scale = (head_dim as f32).sqrt();
+                let scale_t = Tensor::new(scale, &self.dev)
+                    .map_err(|e| e.to_string())?
+                    .to_dtype(x.dtype())
+                    .map_err(|e| e.to_string())?;
+                scores = scores.broadcast_div(&scale_t).map_err(|e| e.to_string())?;
+                scores = scores.broadcast_add(&mask).map_err(|e| e.to_string())?;
+                let attn = nn_ops::softmax(&scores, 1).map_err(|e| e.to_string())?;
+                let ctx = attn.matmul(&vh).map_err(|e| e.to_string())?;
+                ctx_heads.push(ctx);
+            }
+
+            // concat heads -> [T, q_w]
+            let ctx = Tensor::cat(&ctx_heads, 1).map_err(|e| e.to_string())?;
+
+            // o-Proj ausrichten
+            let (wo_a, wo_b) = tensor_dims_2d(&lw.w_o)?;
+            let w_o = if wo_a == q_w {
+                lw.w_o.clone()
+            } else if wo_b == q_w {
+                lw.w_o.t().map_err(|e| e.to_string())?
+            } else {
+                return Err(format!(
+                    "o_proj Form ungueltig: erwartet {}, ist {} x {}",
+                    q_w, wo_a, wo_b
+                ));
+            };
+
+            // Attention-Output + Residual
+            let attn_out = ctx.matmul(&lw.w_o).map_err(|e| e.to_string())?;
+
+            let x_res1 = x.broadcast_add(&attn_out).map_err(|e| e.to_string())?;
+
+            // Pre-FFN RMSNorm
+            let x_mlp_in = rms_norm(&x_res1, &lw.ffn_norm_w, self.d_rms_eps)?;
+
+            // MLP: SwiGLU
+            let gate = x_mlp_in.matmul(&lw.w_gate).map_err(|e| e.to_string())?;
+            let up = x_mlp_in.matmul(&lw.w_up).map_err(|e| e.to_string())?;
+            let act = nn_ops::silu(&gate).map_err(|e| e.to_string())?;
+            let ff = act.broadcast_mul(&up).map_err(|e| e.to_string())?;
+            let down = ff.matmul(&lw.w_down).map_err(|e| e.to_string())?;
+
+            x = x_res1.broadcast_add(&down).map_err(|e| e.to_string())?;
+        }
+
+        // Finale Norm optional
+        let x_out = if let Some(w) = &self.output_norm_w {
+            rms_norm(&x, w, self.d_rms_eps)?
+        } else {
+            x
+        };
+
+        // Logits letztes Token
+        let last = x_out
+            .narrow(0, t - 1, 1)
+            .map_err(|e| e.to_string())?
+            .squeeze(0)
+            .map_err(|e| e.to_string())?;
+        let last = last.unsqueeze(0).map_err(|e| e.to_string())?;
+        let logits = last.matmul(&self.lm_head_hv).map_err(|e| e.to_string())?;
+        let logits = logits.squeeze(0).map_err(|e| e.to_string())?;
+
+        // In f32 konvertieren (unabhängig vom Rechen-DType)
+        let logits_f32 = logits.to_dtype(DType::F32).map_err(|e| e.to_string())?;
+        let v_logits: Vec<f32> = logits_f32.to_vec1::<f32>().map_err(|e| e.to_string())?;
+
+        if debug_on() {
+            let ok = v_logits.len() == self.i_vocab_size;
+            println!(
+                "[CHK-LOGITS] len={} vs vocab={} -> {}",
+                v_logits.len(),
+                self.i_vocab_size,
+                if ok { "OK" } else { "MISMATCH" }
+            );
+            let (mn, mx) = v_logits
+                .iter()
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &x| {
+                    (a.min(x), b.max(x))
+                });
+            println!("[LOGITS] min/max = {:.5}/{:.5}", mn, mx);
+        }
+
+        Ok(v_logits)
+    }
+
+    pub fn vocab_size(&self) -> usize {
+        self.i_vocab_size
+    }
+}
+
+// ------------------------------------------------------------
+// Sampler & Repetition Penalty (von main genutzt)
+// ------------------------------------------------------------
+pub fn prng_next(state: &mut u64) -> u64 {
+    let mut x = *state;
+    if x == 0 {
+        x = 0x9e3779b97f4a7c15u64;
+    }
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    x
+}
+
+pub fn sample_topk(logits: &[f32], temp: f32, k: usize, rng_state: &mut u64) -> usize {
+    let t = if temp > 0.0 { temp } else { 1.0 };
+    let mut pairs: Vec<(usize, f32)> = logits
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (i, v / t))
+        .collect();
+    pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    let top_len = pairs.len().min(k.max(1));
+    let top = &pairs[..top_len];
+    let max_v = top
+        .iter()
+        .map(|(_, v)| *v)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut probs: Vec<f32> = top.iter().map(|(_, v)| (*v - max_v).exp()).collect();
+    let sum: f32 = probs.iter().sum();
+    if sum > 0.0 {
+        for p in &mut probs {
+            *p /= sum;
+        }
+    }
+    let r = {
+        let x = prng_next(rng_state);
+        (x as f64) / (u64::MAX as f64)
+    };
+    let mut acc = 0f64;
+    for (idx, p) in top.iter().map(|(i, _)| *i).zip(probs.iter()) {
+        acc += *p as f64;
+        if r <= acc {
+            return idx;
+        }
+    }
+    top[0].0
+}
+
+pub fn apply_repetition_penalty(v_logits: &mut [f32], v_recent: &[u32], penalty: f32) {
+    let p = penalty.max(1.0);
+    if p == 1.0 || v_recent.is_empty() {
+        return;
+    }
+    use std::collections::HashSet;
+    let mut seen: HashSet<u32> = HashSet::new();
+    for &id in v_recent {
+        seen.insert(id);
+    }
+    for (i, logit) in v_logits.iter_mut().enumerate() {
+        if seen.contains(&(i as u32)) {
+            if *logit > 0.0 {
+                *logit /= p;
+            } else {
+                *logit *= p;
             }
         }
     }
+}
 
-    // Heads % KV-Heads muss aufgehen
-    if i_n_kv_heads == 0 {
-        i_n_kv_heads = 1;
+pub fn sample_topk_topp_minp_with_repeat(
+    logits_in: &[f32],
+    temp: f32,
+    topk: usize,
+    topp: f32,
+    minp: f32,
+    recent: &[u32],
+    rep_penalty: f32,
+    rng_state: &mut u64,
+) -> usize {
+    let mut scores: Vec<f32> = logits_in.to_vec();
+    apply_repetition_penalty(&mut scores, recent, rep_penalty);
+
+    let t = if temp > 0.0 { temp } else { 1.0 };
+    for s in &mut scores {
+        *s /= t;
     }
-    assert!(
-        i_n_heads % i_n_kv_heads == 0,
-        "n_heads must be divisible by n_kv_heads"
-    );
+    let m = scores
+        .iter()
+        .cloned()
+        .fold(f32::NEG_INFINITY, |a, b| a.max(b));
+    for s in &mut scores {
+        *s -= m;
+    }
+    let mut pairs: Vec<(usize, f32)> = scores
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (i, v.exp()))
+        .collect();
+    let sum: f32 = pairs.iter().map(|(_, p)| *p).sum();
+    if !sum.is_finite() || sum <= 0.0 {
+        let mut best = 0usize;
+        let mut best_v = f32::NEG_INFINITY;
+        for (i, &v) in logits_in.iter().enumerate() {
+            if v > best_v {
+                best_v = v;
+                best = i;
+            }
+        }
+        return best;
+    }
+    for (_, p) in &mut pairs {
+        *p /= sum;
+    }
+    pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
-    let cfg = ModelConfig {
-        vocab_size: i_vocab_size.max(vocab_guess),
-        hidden_size: i_hidden_size,
-        intermediate_size: i_intermediate_size,
-        n_layers: i_n_layers,
-        n_heads: i_n_heads,
-        n_kv_heads: i_n_kv_heads,
-        max_seq_len: i_max_seq_len,
-        rope_dim: i_rope_dim,
-        rope_base: d_rope_base,
-
-        rms_eps: d_rms_eps,
-        rope_scaling_type,
-        rope_scaling_factor,
+    // top-k
+    let slice_k: &[(usize, f32)] = if topk > 0 {
+        let keep = pairs.len().min(topk);
+        &pairs[..keep]
+    } else {
+        &pairs[..]
     };
 
-    mdl_dbg!(
-        "build_config: arch='{}' vocab={} hidden={} layers={} heads={} kv_heads={} ffn={} ctx={} rope_dim={} rope_base={}",
-        s_arch,
-        cfg.vocab_size,
-        cfg.hidden_size,
-        cfg.n_layers,
-        cfg.n_heads,
-        cfg.n_kv_heads,
-        cfg.intermediate_size,
-        cfg.max_seq_len,
-        cfg.rope_dim,
-        cfg.rope_base
-    );
-
-    // Hinweis: d_rms_eps bitte in layer.rs in RMSNorm.new(cfg_rms_eps) uebernehmen.
-    cfg
-}
-
-// die Layer zählen
-pub fn count_layers_in_tensors(o_gguf: &crate::gguf_loader::GgufModel) -> usize {
-    // Zähle fortlaufend i = 0,1,2,... solange wir irgendeinen Tensor
-    // mit Präfix "blk.i." oder "layers.i." finden.
-    let mut i = 0usize;
-    loop {
-        let p_blk = format!("blk.{}.", i);
-        let p_old = format!("layers.{}.", i);
-        let has = o_gguf
-            .tensors
-            .keys()
-            .any(|k| k.starts_with(&p_blk) || k.starts_with(&p_old));
-        if !has {
-            break;
-        }
-        i += 1;
-    }
-    i
-}
-
-// ============ Mapping: Namensvarianten erweitern, Checks verschaerfen ============
-
-pub fn map_all_weights(o_gguf: &GgufModel, o_model: &mut TransformerModel) -> Result<(), String> {
-    mdl_dbg!("map_all_weights: start");
-
-    // Embedding
-    if let Some(t) = find_tensor(
-        &o_gguf.tensors,
-        &[
-            "tok_embeddings.weight",
-            "token_embd.weight",
-            "token_embeddings.weight",
-            "embed_tokens.weight",
-            "model.embed_tokens.weight",
-        ],
-    ) {
-        let v_data = t.to_f32_vec()?;
-        let i_ne0 = t.shape[0];
-        let i_ne1 = t.shape[1];
-        mdl_dbg!(
-            "map embedding {}: src=({}x{}), dst=({}x{}), type={}",
-            t.name,
-            i_ne1,
-            i_ne0,
-            o_model.cfg.vocab_size,
-            o_model.cfg.hidden_size,
-            t.type_code
-        );
-        map_ggml_2d_to_rowmajor_labeled(
-            &t.name,
-            &mut o_model.tok_emb,
-            o_model.cfg.vocab_size,
-            o_model.cfg.hidden_size,
-            &v_data,
-            i_ne0,
-            i_ne1,
-        )?;
+    // top-p
+    let use_p = if topp <= 0.0 || !topp.is_finite() {
+        1.0
     } else {
-        mdl_dbg!("map embedding: MISSING");
-    }
-
-    // LM Head
-    let mut lm_head_loaded = false;
-    if let Some(t) = find_tensor(
-        &o_gguf.tensors,
-        &["lm_head.weight", "output.weight", "model.lm_head.weight"],
-    ) {
-        let v_data = t.to_f32_vec()?;
-        let i_ne0 = t.shape[0];
-        let i_ne1 = t.shape[1];
-        mdl_dbg!(
-            "map lm_head {}: src=({}x{}), dst=({}x{}), type={}",
-            t.name,
-            i_ne1,
-            i_ne0,
-            o_model.cfg.hidden_size,
-            o_model.cfg.vocab_size,
-            t.type_code
-        );
-        map_ggml_2d_to_rowmajor_labeled(
-            &t.name,
-            &mut o_model.lm_head,
-            o_model.cfg.hidden_size,
-            o_model.cfg.vocab_size,
-            &v_data,
-            i_ne0,
-            i_ne1,
-        )?;
-        lm_head_loaded = true;
-    } else {
-        mdl_dbg!("map lm_head: no explicit head found -> tie from tok_emb");
-        tie_lm_head_from_tok_emb(o_model);
-        lm_head_loaded = true;
-    }
-    if !lm_head_loaded {
-        return Err("lm_head could not be initialized".to_string());
-    }
-
-    // Final Norm
-    if let Some(t) = o_gguf
-        .tensors
-        .get("output_norm.weight")
-        .or_else(|| o_gguf.tensors.get("norm.weight"))
-        .or_else(|| o_gguf.tensors.get("model.norm.weight"))
-        .or_else(|| o_gguf.tensors.get("final_layernorm.weight"))
-    {
-        set_vector_from_tensor(&mut o_model.final_norm.weight, t)?;
-    } else {
-        mdl_dbg!("final_norm.weight: MISSING");
-    }
-
-    // Blocks
-    let head_dim = o_model.cfg.hidden_size / o_model.cfg.n_heads.max(1);
-    let kv_expected = o_model.cfg.n_kv_heads * head_dim;
-
-    for i in 0..o_model.cfg.n_layers {
-        let s_old = format!("layers.{}", i);
-        let s_new = format!("blk.{}", i);
-
-        // Normen: ln1
-        if let Some(t) = o_gguf
-            .tensors
-            .get(&format!("{}.attention_norm.weight", s_old))
-            .or_else(|| o_gguf.tensors.get(&format!("{}.attn_norm.weight", s_new)))
-            .or_else(|| {
-                o_gguf
-                    .tensors
-                    .get(&format!("{}.input_layernorm.weight", s_old))
-            })
-        {
-            set_vector_from_tensor(&mut o_model.blocks[i].ln1.weight, t)?;
-        } else {
-            mdl_dbg!("blk {} ln1.weight: MISSING", i);
-        }
-
-        // Normen: ln2
-        if let Some(t) = o_gguf
-            .tensors
-            .get(&format!("{}.ffn_norm.weight", s_old))
-            .or_else(|| o_gguf.tensors.get(&format!("{}.ffn_norm.weight", s_new)))
-            .or_else(|| {
-                o_gguf
-                    .tensors
-                    .get(&format!("{}.post_attention_layernorm.weight", s_old))
-            })
-        {
-            set_vector_from_tensor(&mut o_model.blocks[i].ln2.weight, t)?;
-        } else {
-            mdl_dbg!("blk {} ln2.weight: MISSING", i);
-        }
-
-        // Attention Q
-        if let Some(t) = o_gguf
-            .tensors
-            .get(&format!("{}.attention.wq.weight", s_old))
-            .or_else(|| o_gguf.tensors.get(&format!("{}.attn_q.weight", s_new)))
-            .or_else(|| {
-                o_gguf
-                    .tensors
-                    .get(&format!("{}.self_attn.q_proj.weight", s_old))
-            })
-        {
-            set_linear_weight_from_tensor(&mut o_model.blocks[i].attn.w_q, t)?;
-        } else if o_gguf
-            .tensors
-            .contains_key(&format!("{}.self_attn.query_key_value.weight", s_old))
-        {
-            return Err(format!(
-                "blk {} has fused QKV (query_key_value.weight): not supported in this loader",
-                i
-            ));
-        } else {
-            mdl_dbg!("blk {} attn.w_q.weight: MISSING", i);
-        }
-
-        // Attention K
-        if let Some(t) = o_gguf
-            .tensors
-            .get(&format!("{}.attention.wk.weight", s_old))
-            .or_else(|| o_gguf.tensors.get(&format!("{}.attn_k.weight", s_new)))
-            .or_else(|| {
-                o_gguf
-                    .tensors
-                    .get(&format!("{}.self_attn.k_proj.weight", s_old))
-            })
-        {
-            // strenger Check fuer K-Outputdim: n_kv_heads * head_dim
-            let ne_out = if t.shape[1] == o_model.blocks[i].attn.w_k.in_dim {
-                t.shape[0]
-            } else {
-                t.shape[1]
-            };
-            if ne_out != kv_expected {
-                mdl_dbg!(
-                    "warn blk {} attn.k out dim {} != expected kv={} (n_kv_heads * head_dim)",
-                    i,
-                    ne_out,
-                    kv_expected
-                );
+        topp.min(1.0)
+    };
+    let mut keep = slice_k.len();
+    if use_p < 1.0 {
+        let mut acc = 0.0f32;
+        keep = 0usize;
+        for &(_, pr) in slice_k.iter() {
+            acc += pr;
+            keep += 1;
+            if acc >= use_p {
+                break;
             }
-            set_linear_weight_from_tensor(&mut o_model.blocks[i].attn.w_k, t)?;
-        } else {
-            mdl_dbg!("blk {} attn.w_k.weight: MISSING", i);
         }
+        if keep == 0 {
+            keep = 1;
+        }
+    }
+    let mut work: Vec<(usize, f32)> = slice_k[..keep].to_vec();
 
-        // Attention V
-        if let Some(t) = o_gguf
-            .tensors
-            .get(&format!("{}.attention.wv.weight", s_old))
-            .or_else(|| o_gguf.tensors.get(&format!("{}.attn_v.weight", s_new)))
-            .or_else(|| {
-                o_gguf
-                    .tensors
-                    .get(&format!("{}.self_attn.v_proj.weight", s_old))
-            })
-        {
-            let ne_out = if t.shape[1] == o_model.blocks[i].attn.w_v.in_dim {
-                t.shape[0]
-            } else {
-                t.shape[1]
-            };
-            if ne_out != kv_expected {
-                mdl_dbg!(
-                    "warn blk {} attn.v out dim {} != expected kv={} (n_kv_heads * head_dim)",
-                    i,
-                    ne_out,
-                    kv_expected
-                );
-            }
-            set_linear_weight_from_tensor(&mut o_model.blocks[i].attn.w_v, t)?;
-        } else {
-            mdl_dbg!("blk {} attn.w_v.weight: MISSING", i);
-        }
-
-        // Attention O
-        if let Some(t) = o_gguf
-            .tensors
-            .get(&format!("{}.attention.wo.weight", s_old))
-            .or_else(|| o_gguf.tensors.get(&format!("{}.attn_output.weight", s_new)))
-            .or_else(|| {
-                o_gguf
-                    .tensors
-                    .get(&format!("{}.self_attn.o_proj.weight", s_old))
-            })
-        {
-            set_linear_weight_from_tensor(&mut o_model.blocks[i].attn.w_o, t)?;
-        } else {
-            mdl_dbg!("blk {} attn.w_o.weight: MISSING", i);
-        }
-
-        // Attention Bias (optional)
-        if let Some(t) = o_gguf
-            .tensors
-            .get(&format!("{}.attn_q.bias", s_new))
-            .or_else(|| {
-                o_gguf
-                    .tensors
-                    .get(&format!("{}.self_attn.q_proj.bias", s_old))
-            })
-        {
-            set_bias_from_tensor(&mut o_model.blocks[i].attn.w_q.b, t)?;
-        }
-        if let Some(t) = o_gguf
-            .tensors
-            .get(&format!("{}.attn_k.bias", s_new))
-            .or_else(|| {
-                o_gguf
-                    .tensors
-                    .get(&format!("{}.self_attn.k_proj.bias", s_old))
-            })
-        {
-            set_bias_from_tensor(&mut o_model.blocks[i].attn.w_k.b, t)?;
-        }
-        if let Some(t) = o_gguf
-            .tensors
-            .get(&format!("{}.attn_v.bias", s_new))
-            .or_else(|| {
-                o_gguf
-                    .tensors
-                    .get(&format!("{}.self_attn.v_proj.bias", s_old))
-            })
-        {
-            set_bias_from_tensor(&mut o_model.blocks[i].attn.w_v.b, t)?;
-        }
-        if let Some(t) = o_gguf
-            .tensors
-            .get(&format!("{}.attn_output.bias", s_new))
-            .or_else(|| {
-                o_gguf
-                    .tensors
-                    .get(&format!("{}.self_attn.o_proj.bias", s_old))
-            })
-        {
-            set_bias_from_tensor(&mut o_model.blocks[i].attn.w_o.b, t)?;
-        }
-
-        // MLP: up (w1), gate (w3), down (w2)
-        if let Some(t) = o_gguf
-            .tensors
-            .get(&format!("{}.feed_forward.w1.weight", s_old))
-            .or_else(|| o_gguf.tensors.get(&format!("{}.ffn_up.weight", s_new)))
-            .or_else(|| o_gguf.tensors.get(&format!("{}.mlp.up_proj.weight", s_old)))
-        {
-            set_linear_weight_from_tensor(&mut o_model.blocks[i].ffn.w1, t)?;
-        } else {
-            mdl_dbg!("blk {} ffn.w1 (up) weight: MISSING", i);
-        }
-
-        if let Some(t) = o_gguf
-            .tensors
-            .get(&format!("{}.feed_forward.w3.weight", s_old))
-            .or_else(|| o_gguf.tensors.get(&format!("{}.ffn_gate.weight", s_new)))
-            .or_else(|| {
-                o_gguf
-                    .tensors
-                    .get(&format!("{}.mlp.gate_proj.weight", s_old))
-            })
-        {
-            set_linear_weight_from_tensor(&mut o_model.blocks[i].ffn.w3, t)?;
-        } else {
-            mdl_dbg!("blk {} ffn.w3 (gate) weight: MISSING", i);
-        }
-
-        if let Some(t) = o_gguf
-            .tensors
-            .get(&format!("{}.feed_forward.w2.weight", s_old))
-            .or_else(|| o_gguf.tensors.get(&format!("{}.ffn_down.weight", s_new)))
-            .or_else(|| {
-                o_gguf
-                    .tensors
-                    .get(&format!("{}.mlp.down_proj.weight", s_old))
-            })
-        {
-            set_linear_weight_from_tensor(&mut o_model.blocks[i].ffn.w2, t)?;
-        } else {
-            mdl_dbg!("blk {} ffn.w2 (down) weight: MISSING", i);
-        }
-
-        // MLP Bias (optional)
-        if let Some(t) = o_gguf
-            .tensors
-            .get(&format!("{}.ffn_up.bias", s_new))
-            .or_else(|| o_gguf.tensors.get(&format!("{}.mlp.up_proj.bias", s_old)))
-        {
-            set_bias_from_tensor(&mut o_model.blocks[i].ffn.w1.b, t)?;
-        }
-        if let Some(t) = o_gguf
-            .tensors
-            .get(&format!("{}.ffn_gate.bias", s_new))
-            .or_else(|| o_gguf.tensors.get(&format!("{}.mlp.gate_proj.bias", s_old)))
-        {
-            set_bias_from_tensor(&mut o_model.blocks[i].ffn.w3.b, t)?;
-        }
-        if let Some(t) = o_gguf
-            .tensors
-            .get(&format!("{}.ffn_down.bias", s_new))
-            .or_else(|| o_gguf.tensors.get(&format!("{}.mlp.down_proj.bias", s_old)))
-        {
-            set_bias_from_tensor(&mut o_model.blocks[i].ffn.w2.b, t)?;
+    // min-p
+    if minp > 0.0 && minp.is_finite() {
+        let pmax = work.iter().map(|(_, p)| *p).fold(0.0f32, f32::max);
+        let th = pmax * minp;
+        work.retain(|(_, p)| *p >= th);
+        if work.is_empty() {
+            work.push(slice_k[0]);
         }
     }
 
-    mdl_dbg!("map_all_weights: done");
-
-    //validate_layers_nonzero(o_model)?; // wirft Err mit Layer-Index bei Problem
-
-    //println!("tok_emb[0..4] = {:?}", &o_model.tok_emb[0..4]);
-    //println!("lm_head[0..4] = {:?}", &o_model.lm_head[0..4]);
-    Ok(())
-}
-
-// ======================================================================================================
-// model.rs
-// Helper: prüft, ob ein Vektor mindestens einen Wert != 0 (mit Toleranz) enthält
-fn has_nonzero_eps(v: &[f32], eps: f32) -> bool {
-    v.iter().any(|&x| x.abs() > eps)
-}
-
-// Prüfe einen einzelnen Transformer-Block auf mindestens ein nicht-null Gewicht
-fn block_has_nonzero_weights(blk: &crate::layer::TransformerBlock) -> bool {
-    let eps = 1e-12;
-
-    // LayerNorm-Gewichte
-    if has_nonzero_eps(&blk.ln1.weight, eps) {
-        return true;
-    }
-    if has_nonzero_eps(&blk.ln2.weight, eps) {
-        return true;
-    }
-
-    // Attention: Gewichte und Bias
-    if has_nonzero_eps(&blk.attn.w_q.w, eps) {
-        return true;
-    }
-    if has_nonzero_eps(&blk.attn.w_q.b, eps) {
-        return true;
-    }
-
-    if has_nonzero_eps(&blk.attn.w_k.w, eps) {
-        return true;
-    }
-    if has_nonzero_eps(&blk.attn.w_k.b, eps) {
-        return true;
-    }
-
-    if has_nonzero_eps(&blk.attn.w_v.w, eps) {
-        return true;
-    }
-    if has_nonzero_eps(&blk.attn.w_v.b, eps) {
-        return true;
-    }
-
-    if has_nonzero_eps(&blk.attn.w_o.w, eps) {
-        return true;
-    }
-    if has_nonzero_eps(&blk.attn.w_o.b, eps) {
-        return true;
-    }
-
-    // FeedForward: up (w1), gate (w3), down (w2) + Bias
-    if has_nonzero_eps(&blk.ffn.w1.w, eps) {
-        return true;
-    }
-    if has_nonzero_eps(&blk.ffn.w1.b, eps) {
-        return true;
-    }
-
-    if has_nonzero_eps(&blk.ffn.w3.w, eps) {
-        return true;
-    }
-    if has_nonzero_eps(&blk.ffn.w3.b, eps) {
-        return true;
-    }
-
-    if has_nonzero_eps(&blk.ffn.w2.w, eps) {
-        return true;
-    }
-    if has_nonzero_eps(&blk.ffn.w2.b, eps) {
-        return true;
-    }
-
-    false
-}
-
-// Öffentliche Validierung: alle Layer müssen mindestens ein nicht-null Gewicht haben
-pub fn validate_layers_nonzero(model: &TransformerModel) -> Result<(), String> {
-    for (i, blk) in model.blocks.iter().enumerate() {
-        if !block_has_nonzero_weights(blk) {
-            return Err(format!(
-                "Layer {} hat nur Null-Gewichte (Verdacht auf Mapping-Fehler)",
-                i
-            ));
+    // Ziehen
+    let ren: f32 = work.iter().map(|(_, p)| *p).sum();
+    let probs: Vec<f32> = if ren > 0.0 && ren.is_finite() {
+        work.iter().map(|(_, p)| *p / ren).collect()
+    } else {
+        let mut v = vec![0.0f32; work.len()];
+        if !v.is_empty() {
+            v[0] = 1.0;
+        }
+        v
+    };
+    let r = {
+        let x = prng_next(rng_state);
+        (x as f64) / (u64::MAX as f64)
+    };
+    let mut acc = 0.0f64;
+    for ((idx, _), p) in work.iter().zip(probs.iter()) {
+        acc += *p as f64;
+        if r <= acc {
+            return *idx;
         }
     }
-    Ok(())
+    work[0].0
 }
