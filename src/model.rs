@@ -131,49 +131,58 @@ fn build_rope_cos_sin(
 }
 
 fn apply_rope_full(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor, String> {
-    let (_t, d) = x.dims2().map_err(|e| e.to_string())?;
+    let (t, d) = x.dims2().map_err(|e| e.to_string())?;
     if d % 2 != 0 {
-        return Err("head_dim für RoPE muss gerade sein".to_string());
+        return Err("head_dim muss gerade sein".to_string());
     }
     let half = d / 2;
-    let x0 = x.narrow(1, 0, half).map_err(|e| e.to_string())?;
-    let x1 = x.narrow(1, half, half).map_err(|e| e.to_string())?;
-    let y0 = x0
-        .broadcast_mul(cos)
-        .map_err(|e| e.to_string())?
-        .broadcast_sub(&x1.broadcast_mul(sin).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
-    let y1 = x0
-        .broadcast_mul(sin)
-        .map_err(|e| e.to_string())?
-        .broadcast_add(&x1.broadcast_mul(cos).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
-    Tensor::cat(&[y0, y1], 1).map_err(|e| e.to_string())
+
+    // [T, d] -> [T, half, 2] (Paare bilden: (0,1), (2,3), ...)
+    let x_pair = x.reshape((t, half, 2)).map_err(|e| e.to_string())?;
+    let x_even = x_pair.narrow(2, 0, 1).map_err(|e| e.to_string())?.squeeze(2).map_err(|e| e.to_string())?;
+    let x_odd  = x_pair.narrow(2, 1, 1).map_err(|e| e.to_string())?.squeeze(2).map_err(|e| e.to_string())?;
+
+    // cos, sin: [T, half]
+    let y_even = x_even.broadcast_mul(cos).map_err(|e| e.to_string())?
+        .broadcast_sub(&x_odd.broadcast_mul(sin).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let y_odd  = x_even.broadcast_mul(sin).map_err(|e| e.to_string())?
+        .broadcast_add(&x_odd.broadcast_mul(cos).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+
+    // zurück zu [T, d]
+    let y_even = y_even.unsqueeze(2).map_err(|e| e.to_string())?;
+    let y_odd  = y_odd.unsqueeze(2).map_err(|e| e.to_string())?;
+    let y_pair = Tensor::cat(&[y_even, y_odd], 2).map_err(|e| e.to_string())?;
+    y_pair.reshape((t, d)).map_err(|e| e.to_string())
 }
 
-fn apply_rope_partial(
-    x: &Tensor,
-    cos: &Tensor,
-    sin: &Tensor,
-    rope_dim: usize,
-) -> Result<Tensor, String> {
-    let (_t, d) = x.dims2().map_err(|e| e.to_string())?;
-    if rope_dim == d {
-        return apply_rope_full(x, cos, sin);
+fn apply_rope_partial(x: &Tensor, cos: &Tensor, sin: &Tensor, rope_dim: usize) -> Result<Tensor, String> {
+    let (t, d) = x.dims2().map_err(|e| e.to_string())?;
+    if rope_dim == 0 || rope_dim > d || rope_dim % 2 != 0 {
+        return Err(format!("ungueltiger rope_dim: {}, gesamt_dim: {}", rope_dim, d));
     }
-    if rope_dim == 0 || rope_dim > d {
-        return Err(format!(
-            "ungueltiger rope_dim: {}, gesamt_dim: {}",
-            rope_dim, d
-        ));
-    }
+    // vorderer Teil rotieren, Rest passt durch
     let x_rot = x.narrow(1, 0, rope_dim).map_err(|e| e.to_string())?;
-    let x_pas = x
-        .narrow(1, rope_dim, d - rope_dim)
-        .map_err(|e| e.to_string())?;
-    let y_rot = apply_rope_full(&x_rot, cos, sin)?;
+    let x_pas = x.narrow(1, rope_dim, d - rope_dim).map_err(|e| e.to_string())?;
+
+    let half = rope_dim / 2;
+    let x_pair = x_rot.reshape((t, half, 2)).map_err(|e| e.to_string())?;
+    let x_even = x_pair.narrow(2, 0, 1).map_err(|e| e.to_string())?.squeeze(2).map_err(|e| e.to_string())?;
+    let x_odd  = x_pair.narrow(2, 1, 1).map_err(|e| e.to_string())?.squeeze(2).map_err(|e| e.to_string())?;
+
+    // cos/sin haben Form [T, half]
+    let y_even = x_even.broadcast_mul(cos).map_err(|e| e.to_string())?
+        .broadcast_sub(&x_odd.broadcast_mul(sin).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let y_odd  = x_even.broadcast_mul(sin).map_err(|e| e.to_string())?
+        .broadcast_add(&x_odd.broadcast_mul(cos).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+
+    let y_even = y_even.unsqueeze(2).map_err(|e| e.to_string())?;
+    let y_odd  = y_odd.unsqueeze(2).map_err(|e| e.to_string())?;
+    let y_pair = Tensor::cat(&[y_even, y_odd], 2).map_err(|e| e.to_string())?;
+    let y_rot  = y_pair.reshape((t, rope_dim)).map_err(|e| e.to_string())?;
+
     Tensor::cat(&[y_rot, x_pas], 1).map_err(|e| e.to_string())
 }
+
 
 // ------------------------------------------------------------
 // RMSNorm und kausale Maske
@@ -207,15 +216,17 @@ pub fn rms_norm(x: &Tensor, w: &Tensor, eps: f32) -> Result<Tensor, String> {
 }
 
 pub fn causal_mask(dev: &Device, t: usize, dtype: DType) -> Result<Tensor, String> {
+    let neg_inf_f32 = f32::NEG_INFINITY;
     let mut v = vec![0f32; t * t];
     for i in 0..t {
         for j in (i + 1)..t {
-            v[i * t + j] = -1e9f32;
+            v[i * t + j] = neg_inf_f32;
         }
     }
     let m = Tensor::from_vec(v, (t, t), dev).map_err(|e| e.to_string())?;
     to_dtype_if_needed(m, dtype)
 }
+
 
 // ------------------------------------------------------------
 // Konvertierung F16/BF16 -> F32, Safetensors-Reader
@@ -542,7 +553,7 @@ impl TransformerModel {
             let w_o = to_dtype_if_needed(
                 orient_for_right_matmul(
                     &load_2d(&st, &format!("{}.self_attn.o_proj.weight", pre), &dev)?,
-                    i_hidden, // entspricht in Llama dem q_w
+                    i_hidden, // Eingangs-Dim = hidden
                 )?,
                 dtype,
             )?;

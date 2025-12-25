@@ -13,14 +13,18 @@
 // - kein unsafe
 // - klare Fehler
 // - robustes Streaming ohne zerschossene UTF-8-Ausgabe
+//
+// $env:DEBUG_MODEL="0"; $env:LLAMA_WEIGHTS="C:\Entwicklung\rust\GPT-GGUF\model\Llama-3.2-1B\model.safetensors"; $env:LLAMA_CONFIG="C:\Entwicklung\rust\GPT-GGUF\model\Llama-3.2-1B\config.json"; $env:TOKENIZER_JSON="C:\Entwicklung\rust\GPT-GGUF\model\Llama-3.2-1B\tokenizer.json"; $env:BACKEND="transformers"; $env:CHAT_TEMPLATE="llama3"; $env:STOP="<|eot_id|>";  cargo run --bin llm_node --release
+//
 // ------------------------------------------------------------
 
 #![allow(warnings)]
 
 mod model; // eigenes CPU-Transformers-Backend (safetensors)
 mod models_candle; // Candle-Backend (safetensors)
-mod tokenizer; // Tokenizer aus tokenizer.json
+mod local_llama;
 
+mod tokenizer; // Tokenizer aus tokenizer.json
 use std::io::{self, Write};
 
 // ---------------- Env-Helper ----------------
@@ -307,14 +311,21 @@ fn build_backend() -> Result<Box<dyn LmBackend>, String> {
         "bf16" => candle::DType::BF16,
         _ => candle::DType::F32,
     };
-    
+
     match which.as_str() {
         "transformers" => {
+            println!("RUNNING: Transformers");
             let m = model::TransformerModel::from_safetensors(&s_weights, &s_config, dt)?;
             Ok(Box::new(m))
         }
+       /* "hf" => {
+            let m = model_hf_llama::HfLlamaModel::from_safetensors(&s_weights, &s_config, dt)?;
+            Ok(Box::new(m))
+        }*/
+
         // candle (Default)
         _ => {
+            println!("RUNNING: Candle");
             let m = models_candle::CandleLlamaModel::from_safetensors(&s_weights, &s_config, dt)?;
             Ok(Box::new(m))
         }
