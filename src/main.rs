@@ -1,31 +1,44 @@
 // main.rs
 // ------------------------------------------------------------
 // Chat mit Streaming, Stop-IDs, Template-Erkennung
-// Backend wählbar: "candle" (schneller) oder "transformers" (eigener CPU-Forward)
+// Erweiterung: Chat Befehle plus Menu Ausgabe
+//
 // Autor: Marcus Schlieper, ExpChat.ai
-// Kontakt: mschlieper@ylook.de | 49 2338 8748862 | 49 15115751864
-// Firma: ExpChat.ai – Der KI Chat Client für den Mittelstand aus Breckerfeld
-// Zusatz: RPA, KI Agents, KI Internet Research, KI Wissensmanagement
-// Stand: 2025-12-23
-// Lizenz: MIT / Apache-2.0
+// Historie:
+// - 2025-12-23 Marcus Schlieper: Basis Version
+// - 2025-12-26 Marcus Schlieper: Menu und 10 Chat Befehle in main und chat loop
+
+//  $env:LLAMA_DTYPE="f16"; $env:OMP_NUM_THREADS="8";$env:RAYON_NUM_THREADS="8";$env:DEBUG_MODEL="0"; $env:LLAMA_WEIGHTS="d:\Models\Llama-3.2-3B-I\model.safetensors.index.json"; $env:LLAMA_CONFIG="D:\models\Llama-3.2-3B-I\config.json"; $env:TOKENIZER_JSON="D:\models\Llama-3.2-3B-I\tokenizer.json"; $env:BACKEND="candle"; $env:CHAT_TEMPLATE="Llama3"; $env:STOP="<|eot_id|>";  cargo run --bin llm_node --release
+// ------------------------------------------------------------
+// main.rs
+// ------------------------------------------------------------
+// Chat mit Streaming, Stop-IDs, Template-Erkennung
+// Erweiterung: Menu, save und load, und 20 weitere Tools
 //
-// Sicherheit:
-// - kein unsafe
-// - klare Fehler
-// - robustes Streaming ohne zerschossene UTF-8-Ausgabe
-//
-// $env:DEBUG_MODEL="0"; $env:LLAMA_WEIGHTS="C:\Entwicklung\rust\GPT-GGUF\model\Llama-3.2-1B\model.safetensors"; $env:LLAMA_CONFIG="C:\Entwicklung\rust\GPT-GGUF\model\Llama-3.2-1B\config.json"; $env:TOKENIZER_JSON="C:\Entwicklung\rust\GPT-GGUF\model\Llama-3.2-1B\tokenizer.json"; $env:BACKEND="transformers"; $env:CHAT_TEMPLATE="llama3"; $env:STOP="<|eot_id|>";  cargo run --bin llm_node --release
-//
+// Autor: Marcus Schlieper, ExpChat.ai
+// Historie:
+// - 2025-12-23 Marcus Schlieper: Basis Version
+// - 2025-12-26 Marcus Schlieper: Menu und Chat Befehle erweitert, save und load, weitere Tools
+
+// Aufruf:
+// $env:LLAMA_DTYPE="f16"; $env:OMP_NUM_THREADS="8";$env:RAYON_NUM_THREADS="8";$env:DEBUG_MODEL="0"; $env:LLAMA_WEIGHTS="d:\Models\Llama-3.2-3B-I\model.safetensors.index.json"; $env:LLAMA_CONFIG="D:\models\Llama-3.2-3B-I\config.json"; $env:TOKENIZER_JSON="D:\models\Llama-3.2-3B-I\tokenizer.json"; $env:BACKEND="candle"; $env:CHAT_TEMPLATE="Llama3"; $env:STOP="<|eot_id|>";  cargo run --bin llm_node --release
 // ------------------------------------------------------------
 
 #![allow(warnings)]
 
-mod model; // eigenes CPU-Transformers-Backend (safetensors)
-mod models_candle; // Candle-Backend (safetensors)
 mod local_llama;
+mod model;
 
-mod tokenizer; // Tokenizer aus tokenizer.json
+mod model_inspect;
+mod models_candle;
+mod tokenizer;
+
 use std::io::{self, Write};
+use std::path::Path;
+
+use crossterm::event::{self, Event, KeyCode};
+use crossterm::terminal;
+use std::time::Duration;
 
 // ---------------- Env-Helper ----------------
 
@@ -35,12 +48,14 @@ fn env_f32(k: &str, d: f32) -> f32 {
         .and_then(|v| v.parse::<f32>().ok())
         .unwrap_or(d)
 }
+
 fn env_usize(k: &str, d: usize) -> usize {
     std::env::var(k)
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(d)
 }
+
 fn debug_on() -> bool {
     matches!(std::env::var("DEBUG_MODEL"), Ok(s) if s != "0")
 }
@@ -79,7 +94,7 @@ fn detect_chat_template(tok: &tokenizer::GgufTokenizer) -> ChatTemplate {
             _ => ChatTemplate::SimpleTags,
         };
     }
-    // Auto-Heuristik
+
     if token_exists(tok, "<|start_header_id|>")
         && token_exists(tok, "<|end_header_id|>")
         && token_exists(tok, "<|eot_id|>")
@@ -96,7 +111,6 @@ fn detect_chat_template(tok: &tokenizer::GgufTokenizer) -> ChatTemplate {
         return ChatTemplate::ChatML;
     }
     if token_exists(tok, "[INST]") && token_exists(tok, "[/INST]") {
-        // ohne SYS-Blöcke -> Mistral
         return ChatTemplate::Mistral;
     }
     if token_exists(tok, "###") || token_exists(tok, "### Instruction:") {
@@ -114,15 +128,15 @@ fn build_first_turn(
     match fmt {
         ChatTemplate::ChatMLIm => {
             let sys = system_opt.unwrap_or("You are a helpful assistant.");
-            let mut s = String::new();
+            let mut s_out = String::new();
             if token_exists(tok, "<|begin_of_text|>") {
-                s.push_str("<|begin_of_text|>");
+                s_out.push_str("<|begin_of_text|>");
             }
-            s.push_str(&format!(
+            s_out.push_str(&format!(
                 "<|im_start|>system\n{}\n<|im_end|>\n<|im_start|>user\n{}\n<|im_end|>\n<|im_start|>assistant\n",
                 sys, user
             ));
-            s
+            s_out
         }
         ChatTemplate::ChatML => {
             let sys = system_opt.unwrap_or("You are a helpful assistant.");
@@ -142,9 +156,7 @@ fn build_first_turn(
             let sys = system_opt.unwrap_or("You are a helpful assistant.");
             format!("[INST] <<SYS>>\n{}\n<</SYS>>\n\n{} [/INST]\n", sys, user)
         }
-        ChatTemplate::Mistral => {
-            format!("[INST] {}\n[/INST]\n", user)
-        }
+        ChatTemplate::Mistral => format!("[INST] {}\n[/INST]\n", user),
         ChatTemplate::Gemma => {
             let sys = system_opt.unwrap_or("You are a helpful assistant.");
             format!("system\n{}\nuser\n{}\nmodel\n", sys, user)
@@ -160,45 +172,31 @@ fn build_first_turn(
             }
         }
         ChatTemplate::SimpleTags => {
-            let mut s = String::new();
+            let mut s_out = String::new();
             if let Some(sys) = system_opt {
-                s.push_str(&format!("<|system|>\n{}\n", sys));
+                s_out.push_str(&format!("<|system|>\n{}\n", sys));
             }
-            s.push_str(&format!("<|user|>\n{}\n<|assistant|>\n", user));
-            s
+            s_out.push_str(&format!("<|user|>\n{}\n<|assistant|>\n", user));
+            s_out
         }
     }
 }
 
 fn build_next_turn(fmt: ChatTemplate, user: &str) -> String {
     match fmt {
-        ChatTemplate::ChatMLIm => {
-            format!(
-                "<|im_start|>user\n{}\n<|im_end|>\n<|im_start|>assistant\n",
-                user
-            )
-        }
-        ChatTemplate::ChatML => {
-            format!("<|user|>\n{}\n\n<|assistant|>\n", user)
-        }
-        ChatTemplate::Llama3 => {
-            format!(
-                "<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{}\n<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
-                user
-            )
-        }
-        ChatTemplate::Llama2 | ChatTemplate::Mistral => {
-            format!("[INST] {}\n[/INST]\n", user)
-        }
-        ChatTemplate::Gemma => {
-            format!("user\n{}\nmodel\n", user)
-        }
-        ChatTemplate::Alpaca => {
-            format!("### Instruction:\n{}\n\n### Response:\n", user)
-        }
-        ChatTemplate::SimpleTags => {
-            format!("<|user|>\n{}\n<|assistant|>\n", user)
-        }
+        ChatTemplate::ChatMLIm => format!(
+            "<|im_start|>user\n{}\n<|im_end|>\n<|im_start|>assistant\n",
+            user
+        ),
+        ChatTemplate::ChatML => format!("<|user|>\n{}\n\n<|assistant|>\n", user),
+        ChatTemplate::Llama3 => format!(
+            "<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{}\n<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+            user
+        ),
+        ChatTemplate::Llama2 | ChatTemplate::Mistral => format!("[INST] {}\n[/INST]\n", user),
+        ChatTemplate::Gemma => format!("user\n{}\nmodel\n", user),
+        ChatTemplate::Alpaca => format!("### Instruction:\n{}\n\n### Response:\n", user),
+        ChatTemplate::SimpleTags => format!("<|user|>\n{}\n<|assistant|>\n", user),
     }
 }
 
@@ -226,10 +224,7 @@ fn env_or_default_stops(tok: &tokenizer::GgufTokenizer, fmt: ChatTemplate) -> Ve
             .filter(|s| !s.is_empty())
             .collect()
     } else {
-        let mut v = default_stops_for_template(fmt);
-        // nur Strings behalten, die als 1-Token existieren – falls nicht, behalten wir sie trotzdem (konservativ)
-        // v.retain(|s| token_exists(tok, s)); // optional
-        v
+        default_stops_for_template(fmt)
     }
 }
 
@@ -237,8 +232,8 @@ fn env_or_default_stops(tok: &tokenizer::GgufTokenizer, fmt: ChatTemplate) -> Ve
 
 fn compile_stop_id_sequences(tok: &tokenizer::GgufTokenizer, stop_str: &[String]) -> Vec<Vec<u32>> {
     let mut v_seqs: Vec<Vec<u32>> = Vec::new();
-    for s in stop_str {
-        if let Ok(ids) = tok.encode(s, false) {
+    for s_val in stop_str {
+        if let Ok(ids) = tok.encode(s_val, false) {
             if !ids.is_empty() {
                 v_seqs.push(ids);
             }
@@ -267,24 +262,13 @@ fn pick_top1(v_logits: &[f32], d_temp: f32) -> usize {
     i_best
 }
 
-// ---------------- Gemeinsames Backend-Trait ----------------
+// ---------------- Backend-Trait ----------------
 
 trait LmBackend {
     fn forward_tokens(&mut self, ids: &[u32]) -> Result<Vec<f32>, String>;
     fn vocab_size(&self) -> usize;
 }
 
-// Custom: TransformerModel (safetensors)
-impl LmBackend for model::TransformerModel {
-    fn forward_tokens(&mut self, ids: &[u32]) -> Result<Vec<f32>, String> {
-        model::TransformerModel::forward_tokens(self, ids)
-    }
-    fn vocab_size(&self) -> usize {
-        model::TransformerModel::vocab_size(self)
-    }
-}
-
-// Candle (safetensors)
 impl LmBackend for models_candle::CandleLlamaModel {
     fn forward_tokens(&mut self, ids: &[u32]) -> Result<Vec<f32>, String> {
         models_candle::CandleLlamaModel::forward_tokens(self, ids)
@@ -294,15 +278,12 @@ impl LmBackend for models_candle::CandleLlamaModel {
     }
 }
 
-// Backend wählen
 fn build_backend() -> Result<Box<dyn LmBackend>, String> {
     let s_weights =
         std::env::var("LLAMA_WEIGHTS").map_err(|_| "Env LLAMA_WEIGHTS fehlt".to_string())?;
     let s_config =
         std::env::var("LLAMA_CONFIG").map_err(|_| "Env LLAMA_CONFIG fehlt".to_string())?;
-    let which = std::env::var("BACKEND")
-        .unwrap_or_else(|_| "candle".to_string())
-        .to_lowercase();
+
     let dt = match std::env::var("LLAMA_DTYPE")
         .unwrap_or_else(|_| "f32".to_string())
         .as_str()
@@ -312,30 +293,14 @@ fn build_backend() -> Result<Box<dyn LmBackend>, String> {
         _ => candle::DType::F32,
     };
 
-    match which.as_str() {
-        "transformers" => {
-            println!("RUNNING: Transformers");
-            let m = model::TransformerModel::from_safetensors(&s_weights, &s_config, dt)?;
-            Ok(Box::new(m))
-        }
-       /* "hf" => {
-            let m = model_hf_llama::HfLlamaModel::from_safetensors(&s_weights, &s_config, dt)?;
-            Ok(Box::new(m))
-        }*/
-
-        // candle (Default)
-        _ => {
-            println!("RUNNING: Candle");
-            let m = models_candle::CandleLlamaModel::from_safetensors(&s_weights, &s_config, dt)?;
-            Ok(Box::new(m))
-        }
-    }
+    println!("RUNNING: Candle");
+    let m = models_candle::CandleLlamaModel::from_safetensors(&s_weights, &s_config, dt)?;
+    Ok(Box::new(m))
 }
 
-// ---------------- Streaming-Helfer: stabiler UTF-8-Ausdruck ----------------
+// ---------------- Streaming Helper ----------------
 
 fn common_prefix_bytes(a: &str, b: &str) -> usize {
-    // vergleicht nach chars -> erzeugt gültige Byte-Grenzen für UTF-8
     let mut n = 0usize;
     for (ca, cb) in a.chars().zip(b.chars()) {
         if ca == cb {
@@ -347,12 +312,11 @@ fn common_prefix_bytes(a: &str, b: &str) -> usize {
     n
 }
 
-// ---------------- Chat-Loop ----------------
+// ---------------- Chat Tools ----------------
 
-fn chat_loop(
-    tok: tokenizer::GgufTokenizer,
-    mut ctx_ids: Vec<u32>,
-    mut mdl: Box<dyn LmBackend>,
+#[derive(Clone)]
+struct ChatState {
+    s_system_prompt: String,
     d_temp: f32,
     i_max_new: usize,
     i_topk: usize,
@@ -360,265 +324,356 @@ fn chat_loop(
     d_minp: f32,
     d_rep_pen: f32,
     i_rep_win: usize,
-    v_stop_ids: Vec<Vec<u32>>,
-    fmt: ChatTemplate,
-) -> Result<(), String> {
-    println!("Chat gestartet. Tippe exit zum Beenden.");
+    b_echo_prompt: bool,
+    b_debug_show_tokens: bool,
+    i_last_gen_tokens: usize,
+}
 
-    let mut rng_state: u64 = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64 ^ 0xC0FFEE_BAAD_F00D_u64)
-        .unwrap_or(0x1234_5678_9ABC_DEF0_u64);
-
-    let _i_max_stop = max_stop_len(&v_stop_ids);
-    let mut s_input = String::new();
-
-    loop {
-        print!("> ");
-        io::stdout().flush().map_err(|e| e.to_string())?;
-        s_input.clear();
-        io::stdin()
-            .read_line(&mut s_input)
-            .map_err(|e| e.to_string())?;
-        let s_line = s_input.trim();
-        if s_line.eq_ignore_ascii_case("exit") {
-            println!("Tschuess");
-            break;
+fn default_chat_state() -> ChatState {
+    let s_system_prompt = std::env::var("SYSTEM_PROMPT")
+        .unwrap_or_else(|_| "You are a helpful assistant.".to_string());
+    ChatState {
+        s_system_prompt,
+        d_temp: env_f32("TEMP", 0.8),
+        i_max_new: env_usize("MAX_NEW", 64),
+        i_topk: env_usize("TOPK", 40),
+        d_topp: env_f32("TOPP", 0.9),
+        d_minp: env_f32("MINP", 0.0),
+        d_rep_pen: env_f32("REP_PENALTY", 1.1),
+        i_rep_win: env_usize("REP_WINDOW", 256),
+        b_echo_prompt: false,
+        b_debug_show_tokens: false,
+        i_last_gen_tokens: 0,
+    }
+}
+fn is_abort_space_pressed() -> Result<bool, String> {
+    if event::poll(Duration::from_millis(0)).map_err(|e| e.to_string())? {
+        if let Event::Key(k) = event::read().map_err(|e| e.to_string())? {
+            if k.code == KeyCode::Char(' ') {
+                return Ok(true);
+            }
         }
-        if s_line.is_empty() {
+    }
+    Ok(false)
+}
+fn print_menu() {
+    println!("------------------------------------------------------------");
+    println!("Chat Menu");
+    println!("exit                         beendet das programm");
+    println!("help                         zeigt dieses menu");
+    println!("Space                        bricht die laufende ausgabe ab");
+    println!("------------------------------------------------------------");
+    println!("save <file>                  speichert kontext token ids");
+    println!("load <file>                  laedt kontext token ids");
+    println!("sys <text>                   setzt system prompt");
+    println!("show sys                     zeigt system prompt");
+    println!("temp <f32>                   setzt temperatur");
+    println!("topk <usize>                 setzt top k");
+    println!("topp <f32>                   setzt top p");
+    println!("minp <f32>                   setzt min p");
+    println!("maxnew <usize>               setzt max neue tokens");
+    println!("rep <pen> <win>              setzt repetition penalty und window");
+    println!("stats                        zeigt kontext und sampler");
+    println!("vocab                        zeigt vocab size");
+    println!("ctx                          zeigt kontext laenge");
+    println!("ctx pop <n>                  entfernt die letzten n tokens");
+    println!("ctx keep <n>                 behaelt nur die letzten n tokens");
+    println!("ctx head <n>                 zeigt die ersten n tokens als text");
+    println!("ctx tail <n>                 zeigt die letzten n tokens als text");
+    println!("tok <text>                   encodiert text und zeigt token ids");
+    println!("detok <ids>                  decodiert ids, format: 1,2,3");
+    println!("stop show                    zeigt stop strings aus env oder default");
+    println!("template show                zeigt erkanntes template");
+    println!("echo on|off                  zeigt prompt vor generation");
+    println!("show params                  zeigt sampler parameter");
+    println!("reset params                 setzt sampler auf env defaults");
+    println!("debug tokens on|off          zeigt token ids pro generation");
+    println!("bench <n> <text>             generiert n mal fuer test");
+    println!("------------------------------------------------------------");
+}
+
+fn try_parse_f32(s_val: &str) -> Option<f32> {
+    s_val.trim().parse::<f32>().ok()
+}
+
+fn try_parse_usize(s_val: &str) -> Option<usize> {
+    s_val.trim().parse::<usize>().ok()
+}
+
+fn parse_cmd_arg_rest(s_line: &str) -> (String, String) {
+    let mut it = s_line.splitn(2, ' ');
+    let s_cmd = it.next().unwrap_or("").trim().to_string();
+    let s_rest = it.next().unwrap_or("").trim().to_string();
+    (s_cmd, s_rest)
+}
+
+fn parse_two_args(s_line: &str) -> Option<(String, String)> {
+    let mut it = s_line.split_whitespace();
+    let s_a = it.next()?.to_string();
+    let s_b = it.next()?.to_string();
+    Some((s_a, s_b))
+}
+
+fn parse_three_args(s_line: &str) -> Option<(String, String, String)> {
+    let mut it = s_line.split_whitespace();
+    let s_a = it.next()?.to_string();
+    let s_b = it.next()?.to_string();
+    let s_c = it.next()?.to_string();
+    Some((s_a, s_b, s_c))
+}
+
+fn parse_ids_csv(s_ids: &str) -> Result<Vec<u32>, String> {
+    let mut v_ids: Vec<u32> = Vec::new();
+    for s_part in s_ids.split(',') {
+        let s_t = s_part.trim();
+        if s_t.is_empty() {
             continue;
         }
+        let i_val = s_t
+            .parse::<u32>()
+            .map_err(|_| "detok: ungueltige id liste".to_string())?;
+        v_ids.push(i_val);
+    }
+    if v_ids.is_empty() {
+        return Err("detok: keine ids".to_string());
+    }
+    Ok(v_ids)
+}
 
-        // Benutzer-Zugabe in den Kontext einbetten
-        if ctx_ids.is_empty() {
-            if let Some(bos) = tok.bos_id() {
-                ctx_ids.push(bos);
-            }
-            let s_sys = std::env::var("SYSTEM_PROMPT")
-                .unwrap_or_else(|_| "You are a helpful assistant.".to_string());
-            let s_first = build_first_turn(fmt, &tok, Some(&s_sys), s_line);
-            let ids = tok.encode(&s_first, false)?;
-            ctx_ids.extend_from_slice(&ids);
+fn is_safe_file_name(s_file: &str) -> bool {
+    if s_file.is_empty() {
+        return false;
+    }
+    if s_file.contains("..") {
+        return false;
+    }
+    if s_file.contains(':') {
+        return false;
+    }
+    if s_file.contains('\\') {
+        return false;
+    }
+    if s_file.contains('/') {
+        return false;
+    }
+    true
+}
 
-            if debug_on() {
-                println!(
-                    "[DBG] first turn: template={:?}, sys_len={}, user_len={}",
-                    fmt,
-                    s_sys.len(),
-                    s_line.len()
-                );
-                println!("[DBG] ctx_len_after_first = {}", ctx_ids.len());
-            }
-        } else {
-            let s_next = build_next_turn(fmt, s_line);
-            let ids = tok.encode(&s_next, false)?;
-            ctx_ids.extend_from_slice(&ids);
-            if debug_on() {
-                println!("[DBG] appended next turn, ctx_len = {}", ctx_ids.len());
-            }
-        }
-
-        let mut pending: Vec<u32> = Vec::new();
-        let mut printed_any = false;
-        let mut s_printed = String::new(); // stabiler Streaming-Puffer
-
-        if debug_on() {
-            println!("[DBG] generation start: ctx_len = {}", ctx_ids.len());
-        }
-
-        for step in 0..i_max_new {
-            // Repetition window
-            let start = ctx_ids.len().saturating_sub(i_rep_win);
-            let v_recent = &ctx_ids[start..];
-
-            // Logits
-            let v_logits = mdl.forward_tokens(&ctx_ids)?;
-            let next_idx = if (d_topp > 0.0 && d_topp <= 1.0) || d_minp > 0.0 || d_rep_pen > 1.0 {
-                model::sample_topk_topp_minp_with_repeat(
-                    &v_logits,
-                    d_temp,
-                    i_topk,
-                    d_topp,
-                    d_minp,
-                    v_recent,
-                    d_rep_pen,
-                    &mut rng_state,
-                ) as u32
-            } else if i_topk > 0 {
-                model::sample_topk(&v_logits, d_temp, i_topk, &mut rng_state) as u32
-            } else {
-                pick_top1(&v_logits, d_temp) as u32
-            };
-
-            ctx_ids.push(next_idx);
-            pending.push(next_idx);
-
-            // Stop-IDs prüfen (vollständige Sequenz am Ende)
-            let mut hit_stop = false;
-            let mut stop_n = 0usize;
-            'stopcheck: for seq in &v_stop_ids {
-                let n = seq.len();
-                if n == 0 || ctx_ids.len() < n {
-                    continue;
-                }
-                let tail = &ctx_ids[ctx_ids.len() - n..];
-                if tail == seq.as_slice() {
-                    stop_n = n;
-                    hit_stop = true;
-                    break 'stopcheck;
-                }
-            }
-
-            if hit_stop {
-                // Nur sicheren Teil (ohne Stop-Sequenz) ausgeben:
-                if pending.len() > stop_n {
-                    let safe = &pending[..pending.len() - stop_n];
-                    if !safe.is_empty() {
-                        let rest = tok.decode(safe, true).unwrap_or_default();
-                        let i_cp = common_prefix_bytes(&s_printed, &rest);
-                        let new_bytes = &rest.as_bytes()[i_cp..];
-                        if !new_bytes.is_empty() {
-                            if let Ok(new_str) = std::str::from_utf8(new_bytes) {
-                                print!("{}", new_str);
-                                io::stdout().flush().map_err(|e| e.to_string())?;
-                                printed_any = true;
-                            }
-                        }
-                    }
-                }
-                pending.clear();
-                s_printed.clear();
-                println!();
-                println!();
-                if debug_on() {
-                    println!(
-                        "[DBG] stop hit at step {}, ctx_len = {}",
-                        step,
-                        ctx_ids.len()
-                    );
-                }
-                break;
-            }
-
-            // Streaming stabil: gesamte Pending decodieren, nur neuen Suffix drucken
-            let s_all = tok.decode(&pending, true).unwrap_or_default();
-            let i_cp = common_prefix_bytes(&s_printed, &s_all);
-            let new_bytes = &s_all.as_bytes()[i_cp..];
-            if !new_bytes.is_empty() {
-                if let Ok(new_str) = std::str::from_utf8(new_bytes) {
-                    print!("{}", new_str);
-                    io::stdout().flush().map_err(|e| e.to_string())?;
-                    printed_any = true;
-                }
-            }
-            s_printed = s_all;
-
-            // EOS?
-            if let Some(eos) = tok.eos_id() {
-                if next_idx == eos {
-                    // Rest final ausgeben (falls noch nicht gezeigt)
-                    if !pending.is_empty() {
-                        let rest = tok.decode(&pending, true).unwrap_or_default();
-                        let i_cp = common_prefix_bytes(&s_printed, &rest);
-                        let new_bytes = &rest.as_bytes()[i_cp..];
-                        if !new_bytes.is_empty() {
-                            if let Ok(new_str) = std::str::from_utf8(new_bytes) {
-                                print!("{}", new_str);
-                                io::stdout().flush().map_err(|e| e.to_string())?;
-                            }
-                        }
-                        pending.clear();
-                        s_printed.clear();
-                    }
-                    println!();
-                    println!();
-                    if debug_on() {
-                        println!(
-                            "[DBG] eos reached at step {}, ctx_len = {}",
-                            step,
-                            ctx_ids.len()
-                        );
-                    }
-                    break;
-                }
-            }
-        }
-
-        // Falls kein Stop/EOS ausgelöst, eventuell verbliebene Ausgabe zeigen
-        if !pending.is_empty() {
-            let rest = tok.decode(&pending, true).unwrap_or_default();
-            let i_cp = common_prefix_bytes(&s_printed, &rest);
-            let new_bytes = &rest.as_bytes()[i_cp..];
-            if !new_bytes.is_empty() {
-                if let Ok(new_str) = std::str::from_utf8(new_bytes) {
-                    print!("{}", new_str);
-                    io::stdout().flush().map_err(|e| e.to_string())?;
-                }
-            }
-            pending.clear();
-            s_printed.clear();
-        }
-        if !printed_any {
-            println!("[kein Token erzeugt]");
-        }
-        println!();
+fn save_ctx_to_file(s_file: &str, v_ctx_ids: &[u32]) -> Result<(), String> {
+    if !is_safe_file_name(s_file) {
+        return Err("save: ungueltiger dateiname".to_string());
+    }
+    if v_ctx_ids.is_empty() {
+        return Err("save: kontext ist leer".to_string());
     }
 
+    let mut s_out = String::new();
+    for (i, id) in v_ctx_ids.iter().enumerate() {
+        if i > 0 {
+            s_out.push(',');
+        }
+        s_out.push_str(&id.to_string());
+    }
+
+    std::fs::write(s_file, s_out).map_err(|e| format!("save: schreiben fehlgeschlagen: {}", e))?;
     Ok(())
+}
+
+fn load_ctx_from_file(s_file: &str) -> Result<Vec<u32>, String> {
+    if !is_safe_file_name(s_file) {
+        return Err("load: ungueltiger dateiname".to_string());
+    }
+    if !Path::new(s_file).exists() {
+        return Err("load: datei fehlt".to_string());
+    }
+
+    let s_raw = std::fs::read_to_string(s_file)
+        .map_err(|e| format!("load: lesen fehlgeschlagen: {}", e))?;
+    let v_ids = parse_ids_csv(&s_raw)?;
+    Ok(v_ids)
+}
+
+fn print_params(o_state: &ChatState) {
+    println!(
+        "temp={} maxnew={} topk={} topp={} minp={} rep_penalty={} rep_window={}",
+        o_state.d_temp,
+        o_state.i_max_new,
+        o_state.i_topk,
+        o_state.d_topp,
+        o_state.d_minp,
+        o_state.d_rep_pen,
+        o_state.i_rep_win
+    );
+}
+
+fn reset_params_from_env(o_state: &mut ChatState) {
+    o_state.d_temp = env_f32("TEMP", 0.8);
+    o_state.i_max_new = env_usize("MAX_NEW", 64);
+    o_state.i_topk = env_usize("TOPK", 40);
+    o_state.d_topp = env_f32("TOPP", 0.9);
+    o_state.d_minp = env_f32("MINP", 0.0);
+    o_state.d_rep_pen = env_f32("REP_PENALTY", 1.1);
+    o_state.i_rep_win = env_usize("REP_WINDOW", 256);
+}
+
+// ---------------- Chat-Loop ----------------
+
+// ------------------------------------------------------------
+// Chat Loop
+// Aenderung:
+// - raw mode aktiv fuer sofortige taste
+// - generation kann mit space abgebrochen werden
+//
+// Autor: Marcus Schlieper, ExpChat.ai
+// Historie:
+// - 2025-12-26 Marcus Schlieper: space abort
+// ------------------------------------------------------------
+fn chat_loop(
+    tok: tokenizer::GgufTokenizer,
+    mut ctx_ids: Vec<u32>,
+    mut mdl: Box<dyn LmBackend>,
+    fmt: ChatTemplate,
+) -> Result<(), String> {
+    terminal::enable_raw_mode().map_err(|e| e.to_string())?;
+
+    let r_out = (|| -> Result<(), String> {
+        print_menu();
+        println!("Chat gestartet. Tippe help fuer menu.");
+
+        let mut rng_state: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64 ^ 0xC0FFEE_BAAD_F00D_u64)
+            .unwrap_or(0x1234_5678_9ABC_DEF0_u64);
+
+        let v_stop_str = env_or_default_stops(&tok, fmt);
+        let v_stop_ids = compile_stop_id_sequences(&tok, &v_stop_str);
+
+        let mut s_input = String::new();
+
+        loop {
+            // raw mode: du kannst nicht normal read_line nutzen, weil enter nicht wie gewohnt geht.
+            // Loesung: wir bleiben fuer eingabe bei normal mode? Oder du nutzt eine eigene line editor.
+            // Minimal invasiv: raw mode nur waehrend generation aktivieren.
+
+            // daher: hier raw mode kurz aus, eingabe lesen, dann wieder an
+            terminal::disable_raw_mode().map_err(|e| e.to_string())?;
+            print!("> ");
+            io::stdout().flush().map_err(|e| e.to_string())?;
+            s_input.clear();
+            io::stdin()
+                .read_line(&mut s_input)
+                .map_err(|e| e.to_string())?;
+            terminal::enable_raw_mode().map_err(|e| e.to_string())?;
+
+            let s_line = s_input.trim();
+            if s_line.is_empty() {
+                continue;
+            }
+
+            let s_line_lc = s_line.to_lowercase();
+            if s_line_lc == "exit" {
+                println!("Tschuess");
+                break;
+            }
+            if s_line_lc == "help" {
+                print_menu();
+                continue;
+            }
+
+            // prompt bauen wie gehabt
+            if ctx_ids.is_empty() {
+                if let Some(bos) = tok.bos_id() {
+                    ctx_ids.push(bos);
+                }
+                let s_sys = std::env::var("SYSTEM_PROMPT")
+                    .unwrap_or_else(|_| "You are a helpful assistant.".to_string());
+                let s_first = build_first_turn(fmt, &tok, Some(&s_sys), s_line);
+                let ids = tok.encode(&s_first, true)?;
+                ctx_ids.extend_from_slice(&ids);
+            } else {
+                let s_next = build_next_turn(fmt, s_line);
+                let ids = tok.encode(&s_next, false)?;
+                ctx_ids.extend_from_slice(&ids);
+            }
+
+            // generation
+            let mut pending: Vec<u32> = Vec::new();
+            let mut s_printed = String::new();
+            let mut printed_any = false;
+
+            for _step in 0..env_usize("MAX_NEW", 64) {
+                // Abbruch mit Space
+                if is_abort_space_pressed()? {
+                    println!();
+                    println!("[abbruch durch space]");
+                    println!();
+                    break;
+                }
+
+                let v_logits = mdl.forward_tokens(&ctx_ids)?;
+                let next_idx = pick_top1(&v_logits, env_f32("TEMP", 0.8)) as u32;
+
+                ctx_ids.push(next_idx);
+                pending.push(next_idx);
+
+                // streaming stabil
+                let s_all = tok.decode(&pending, true).unwrap_or_default();
+                let i_cp = common_prefix_bytes(&s_printed, &s_all);
+                let new_bytes = &s_all.as_bytes()[i_cp..];
+                if !new_bytes.is_empty() {
+                    if let Ok(new_str) = std::str::from_utf8(new_bytes) {
+                        print!("{}", new_str);
+                        io::stdout().flush().map_err(|e| e.to_string())?;
+                        printed_any = true;
+                    }
+                }
+                s_printed = s_all;
+
+                // stop ids check wie gehabt (hier kurz gelassen)
+                for seq in &v_stop_ids {
+                    let n = seq.len();
+                    if n == 0 || ctx_ids.len() < n {
+                        continue;
+                    }
+                    let tail = &ctx_ids[ctx_ids.len() - n..];
+                    if tail == seq.as_slice() {
+                        println!();
+                        println!();
+                        pending.clear();
+                        s_printed.clear();
+                        break;
+                    }
+                }
+            }
+
+            if !printed_any {
+                println!("[kein token erzeugt]");
+            }
+        }
+
+        Ok(())
+    })();
+
+    terminal::disable_raw_mode().map_err(|e| e.to_string())?;
+    r_out
 }
 
 // ---------------- main ----------------
 
 fn main() -> Result<(), String> {
-    // Erforderlich: Weights, Config, Tokenizer
     let s_tok_json = std::env::var("TOKENIZER_JSON")
         .map_err(|_| "Bitte TOKENIZER_JSON auf tokenizer.json setzen".to_string())?;
     let o_tok = tokenizer::load_tokenizer_from_json_force(&s_tok_json)
-        .map_err(|e| format!("Tokenizer-Load Fehler: {}", e))?;
+        .map_err(|e| format!("Tokenizer Load Fehler: {}", e))?;
 
-    // Sampling
-    let d_temperature = env_f32("TEMP", 0.8);
-    let i_max_new = env_usize("MAX_NEW", 64);
-    let i_topk = env_usize("TOPK", 40);
-    let d_topp = env_f32("TOPP", 0.9);
-    let d_minp = env_f32("MINP", 0.0);
-    let d_rep_pen = env_f32("REP_PENALTY", 1.1);
-    let i_rep_win = env_usize("REP_WINDOW", 256);
-
-    // Backend
     let mut o_backend = build_backend()?;
     println!("Vokabular (Backend): {}", o_backend.vocab_size());
 
-    // Template + Stops
     let e_fmt = detect_chat_template(&o_tok);
-    let v_stop_str = env_or_default_stops(&o_tok, e_fmt);
-    let v_stop_ids = compile_stop_id_sequences(&o_tok, &v_stop_str);
-
     if debug_on() {
         println!("[CHK] BOS={:?} | EOS={:?}", o_tok.bos_id(), o_tok.eos_id());
-        let stop_raw = std::env::var("STOP").unwrap_or_else(|_| "".to_string());
-        println!("[CHK] STOP strings = {}", stop_raw);
         println!("[CHK] DETECTED_TEMPLATE = {:?}", e_fmt);
     }
 
-    println!(
-        "Temperature = {}, Max New = {}, Top-k = {}, Top-p = {}, Min-p = {}, RepPenalty = {}, RepWindow = {}, Stop = {:?}, Template = {:?}",
-        d_temperature, i_max_new, i_topk, d_topp, d_minp, d_rep_pen, i_rep_win, v_stop_str, e_fmt
-    );
-
-    // Chat
-    chat_loop(
-        o_tok,
-        Vec::new(),
-        o_backend,
-        d_temperature,
-        i_max_new,
-        i_topk,
-        d_topp,
-        d_minp,
-        d_rep_pen,
-        i_rep_win,
-        v_stop_ids,
-        e_fmt,
-    )
+    chat_loop(o_tok, Vec::new(), o_backend, e_fmt)
 }
