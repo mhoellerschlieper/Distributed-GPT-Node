@@ -1,0 +1,151 @@
+{
+  "self_peer_id": "12D3KooWFQrhmJ9hnkWgYevsVWDowqy3WURtfr4mX7Qh73C21eVZ",
+  
+  "peers":[
+	{ "peer_id": "12D3KooWFQrhmJ9hnkWgYevsVWDowqy3WURtfr4mX7Qh73C21eVZ", "addr": "/ip4/127.0.0.1/tcp/4002" },
+	{ "peer_id": "12D3KooWPhzUeJwg9QFPUQx21k9org1wZ9srBtwUdbV9R1E1e62w", "addr": "/ip4/127.0.0.1/tcp/4001" }
+  ],
+  
+  "routes": [
+    {
+      "model_name": "llama",
+      "block_no": 0,
+      "peer_id": "12D3KooWFQrhmJ9hnkWgYevsVWDowqy3WURtfr4mX7Qh73C21eVZ"
+    },
+    {
+      "model_name": "llama",
+      "block_no": 1,
+      "peer_id": "12D3KooWPhzUeJwg9QFPUQx21k9org1wZ9srBtwUdbV9R1E1e62w"
+    },
+    {
+      "model_name": "llama",
+      "block_no": 2,
+      "peer_id": "12D3KooWFQrhmJ9hnkWgYevsVWDowqy3WURtfr4mX7Qh73C21eVZ"
+    },
+    {
+      "model_name": "llama",
+      "block_no": 3,
+      "peer_id": "12D3KooWFQrhmJ9hnkWgYevsVWDowqy3WURtfr4mX7Qh73C21eVZ"
+    },
+    {
+      "model_name": "llama",
+      "block_no": 4,
+      "peer_id": "12D3KooWFQrhmJ9hnkWgYevsVWDowqy3WURtfr4mX7Qh73C21eVZ"
+    },
+    {
+      "model_name": "llama",
+      "block_no": 5,
+      "peer_id": "12D3KooWFQrhmJ9hnkWgYevsVWDowqy3WURtfr4mX7Qh73C21eVZ"
+    },
+    {
+      "model_name": "llama",
+      "block_no": 6,
+      "peer_id": "12D3KooWFQrhmJ9hnkWgYevsVWDowqy3WURtfr4mX7Qh73C21eVZ"
+    },
+    {
+      "model_name": "llama",
+      "block_no": 7,
+      "peer_id": "12D3KooWFQrhmJ9hnkWgYevsVWDowqy3WURtfr4mX7Qh73C21eVZ"
+    },
+    {
+      "model_name": "llama",
+      "block_no": 8,
+      "peer_id": "12D3KooWFQrhmJ9hnkWgYevsVWDowqy3WURtfr4mX7Qh73C21eVZ"
+    },
+    {
+      "model_name": "llama",
+      "block_no": 9,
+      "peer_id": "12D3KooWFQrhmJ9hnkWgYevsVWDowqy3WURtfr4mX7Qh73C21eVZ"
+    },
+    {
+      "model_name": "llama",
+      "block_no": 10,
+      "peer_id": "12D3KooWFQrhmJ9hnkWgYevsVWDowqy3WURtfr4mX7Qh73C21eVZ"
+    },
+    {
+      "model_name": "llama",
+      "block_no": 11,
+      "peer_id": "12D3KooWFQrhmJ9hnkWgYevsVWDowqy3WURtfr4mX7Qh73C21eVZ"
+    },
+    {
+      "model_name": "llama",
+      "block_no": 12,
+      "peer_id": "12D3KooWFQrhmJ9hnkWgYevsVWDowqy3WURtfr4mX7Qh73C21eVZ"
+    },
+    {
+      "model_name": "llama",
+      "block_no": 13,
+      "peer_id": "12D3KooWFQrhmJ9hnkWgYevsVWDowqy3WURtfr4mX7Qh73C21eVZ"
+    },
+    {
+      "model_name": "llama",
+      "block_no": 14,
+      "peer_id": "12D3KooWFQrhmJ9hnkWgYevsVWDowqy3WURtfr4mX7Qh73C21eVZ"
+    },
+    {
+      "model_name": "llama",
+      "block_no": 15,
+      "peer_id": "12D3KooWFQrhmJ9hnkWgYevsVWDowqy3WURtfr4mX7Qh73C21eVZ"
+    },
+    {
+      "model_name": "llama",
+      "block_no": 16,
+      "peer_id": "12D3KooWFQrhmJ9hnkWgYevsVWDowqy3WURtfr4mX7Qh73C21eVZ"
+    },
+    {
+      "model_name": "llama",
+      "block_no": 17,
+      "peer_id": "12D3KooWFQrhmJ9hnkWgYevsVWDowqy3WURtfr4mX7Qh73C21eVZ"
+    },
+    {
+      "model_name": "llama",
+      "block_no": 18,
+      "peer_id": "12D3KooWFQrhmJ9hnkWgYevsVWDowqy3WURtfr4mX7Qh73C21eVZ"
+    },
+    {
+      "model_name": "llama",
+      "block_no": 19,
+      "peer_id": "12D3KooWFQrhmJ9hnkWgYevsVWDowqy3WURtfr4mX7Qh73C21eVZ"
+    },
+    {
+      "model_name": "llama",
+      "block_no": 20,
+      "peer_id": "12D3KooWFQrhmJ9hnkWgYevsVWDowqy3WURtfr4mX7Qh73C21eVZ"
+    },
+    {
+      "model_name": "llama",
+      "block_no": 21,
+      "peer_id": "12D3KooWFQrhmJ9hnkWgYevsVWDowqy3WURtfr4mX7Qh73C21eVZ"
+    },
+    {
+      "model_name": "llama",
+      "block_no": 22,
+      "peer_id": "12D3KooWFQrhmJ9hnkWgYevsVWDowqy3WURtfr4mX7Qh73C21eVZ"
+    },
+    {
+      "model_name": "llama",
+      "block_no": 23,
+      "peer_id": "12D3KooWFQrhmJ9hnkWgYevsVWDowqy3WURtfr4mX7Qh73C21eVZ"
+    },
+    {
+      "model_name": "llama",
+      "block_no": 24,
+      "peer_id": "12D3KooWFQrhmJ9hnkWgYevsVWDowqy3WURtfr4mX7Qh73C21eVZ"
+    },
+    {
+      "model_name": "llama",
+      "block_no": 25,
+      "peer_id": "12D3KooWFQrhmJ9hnkWgYevsVWDowqy3WURtfr4mX7Qh73C21eVZ"
+    },
+    {
+      "model_name": "llama",
+      "block_no": 26,
+      "peer_id": "12D3KooWFQrhmJ9hnkWgYevsVWDowqy3WURtfr4mX7Qh73C21eVZ"
+    },
+    {
+      "model_name": "llama",
+      "block_no": 27,
+      "peer_id": "12D3KooWFQrhmJ9hnkWgYevsVWDowqy3WURtfr4mX7Qh73C21eVZ"
+    }
+  ]
+}

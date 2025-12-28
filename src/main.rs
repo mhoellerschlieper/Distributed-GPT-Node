@@ -1,27 +1,21 @@
 // main.rs
 // ------------------------------------------------------------
 // Chat mit Streaming, Stop-IDs, Template-Erkennung
-// Erweiterung: Chat Befehle plus Menu Ausgabe
-//
-// Autor: Marcus Schlieper, ExpChat.ai
-// Historie:
-// - 2025-12-23 Marcus Schlieper: Basis Version
-// - 2025-12-26 Marcus Schlieper: Menu und 10 Chat Befehle in main und chat loop
-
-//  $env:LLAMA_DTYPE="f16"; $env:OMP_NUM_THREADS="8";$env:RAYON_NUM_THREADS="8";$env:DEBUG_MODEL="0"; $env:LLAMA_WEIGHTS="d:\Models\Llama-3.2-3B-I\model.safetensors.index.json"; $env:LLAMA_CONFIG="D:\models\Llama-3.2-3B-I\config.json"; $env:TOKENIZER_JSON="D:\models\Llama-3.2-3B-I\tokenizer.json"; $env:BACKEND="candle"; $env:CHAT_TEMPLATE="Llama3"; $env:STOP="<|eot_id|>";  cargo run --bin llm_node --release
-// ------------------------------------------------------------
-// main.rs
-// ------------------------------------------------------------
-// Chat mit Streaming, Stop-IDs, Template-Erkennung
-// Erweiterung: Menu, save und load, und 20 weitere Tools
+// Erweiterung: Menu, save und load, Tools, P2P auto connect und P2P server handler
 //
 // Autor: Marcus Schlieper, ExpChat.ai
 // Historie:
 // - 2025-12-23 Marcus Schlieper: Basis Version
 // - 2025-12-26 Marcus Schlieper: Menu und Chat Befehle erweitert, save und load, weitere Tools
+// - 2025-12-28 Marcus Schlieper: P2P peers aus blocks_map, auto connect, server handler fuer block run
+//
+// Hinweis
+// - Sonderzeichen in Code und Beschreibung sind vermieden
+// - sichere Dateinamen checks sind enthalten
+// - server antwortet immer mit RunBlockResponse inkl s_error
+// p2p-Aufruf:
+// $env:P2P_PORT="4002"; $env:LLAMA_DTYPE="f16"; $env:OMP_NUM_THREADS="8";$env:RAYON_NUM_THREADS="8";$env:DEBUG_MODEL="0"; $env:LLAMA_WEIGHTS="d:\Models\Llama-3.2-3B-I\model.safetensors.index.json"; $env:LLAMA_CONFIG="D:\models\Llama-3.2-3B-I\config.json"; $env:TOKENIZER_JSON="D:\models\Llama-3.2-3B-I\tokenizer.json"; $env:BACKEND="p2p"; $env:CHAT_TEMPLATE="Llama3"; $env:STOP="<|eot_id|>";  cargo run --bin llm_node --release
 
-// Aufruf:
-// $env:LLAMA_DTYPE="f16"; $env:OMP_NUM_THREADS="8";$env:RAYON_NUM_THREADS="8";$env:DEBUG_MODEL="0"; $env:LLAMA_WEIGHTS="d:\Models\Llama-3.2-3B-I\model.safetensors.index.json"; $env:LLAMA_CONFIG="D:\models\Llama-3.2-3B-I\config.json"; $env:TOKENIZER_JSON="D:\models\Llama-3.2-3B-I\tokenizer.json"; $env:BACKEND="candle"; $env:CHAT_TEMPLATE="Llama3"; $env:STOP="<|eot_id|>";  cargo run --bin llm_node --release
 // ------------------------------------------------------------
 
 #![allow(warnings)]
@@ -33,14 +27,36 @@ mod model_inspect;
 mod models_candle;
 mod tokenizer;
 
-use std::io::{self, Write};
-use std::path::Path;
+mod models_p2p;
+mod p2p_blocks_map;
+mod p2p_client_libp2p;
+mod p2p_codec;
+mod p2p_identity;
+mod p2p_llama_forward;
+mod p2p_node;
+mod p2p_runtime_handle;
+mod p2p_tensor_conv;
+mod p2p_wire;
 
+use async_trait::async_trait;
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::terminal;
+use libp2p::PeerId;
+use std::io::{self, Write};
+use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 
-// ---------------- Env-Helper ----------------
+use crate::p2p_tensor_conv::{tensor_to_wire, wire_to_tensor};
+use crate::p2p_wire::RunBlockResponse;
+
+fn env_u16(k: &str, d: u16) -> u16 {
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(d)
+}
 
 fn env_f32(k: &str, d: f32) -> f32 {
     std::env::var(k)
@@ -56,11 +72,15 @@ fn env_usize(k: &str, d: usize) -> usize {
         .unwrap_or(d)
 }
 
-fn debug_on() -> bool {
-    matches!(std::env::var("DEBUG_MODEL"), Ok(s) if s != "0")
+fn env_string(k: &str, d: &str) -> String {
+    std::env::var(k).unwrap_or_else(|_| d.to_string())
 }
 
-// ---------------- Prompt-Templates ----------------
+fn debug_on() -> bool {
+    matches!(std::env::var("DEBUG_MODEL"), Ok(s_val) if s_val != "0")
+}
+
+// ---------------- Prompt Templates ----------------
 
 #[derive(Clone, Copy, Debug)]
 enum ChatTemplate {
@@ -74,16 +94,16 @@ enum ChatTemplate {
     SimpleTags,
 }
 
-fn token_exists(tok: &tokenizer::GgufTokenizer, s: &str) -> bool {
-    tok.encode(s, false)
+fn token_exists(tok: &tokenizer::GgufTokenizer, s_val: &str) -> bool {
+    tok.encode(s_val, false)
         .map(|ids| ids.len() == 1)
         .unwrap_or(false)
 }
 
 fn detect_chat_template(tok: &tokenizer::GgufTokenizer) -> ChatTemplate {
     if let Ok(sel) = std::env::var("CHAT_TEMPLATE") {
-        let s = sel.to_lowercase();
-        return match s.as_str() {
+        let s_lc = sel.to_lowercase();
+        return match s_lc.as_str() {
             "qwen" | "chatml_im" | "im" => ChatTemplate::ChatMLIm,
             "chatml" => ChatTemplate::ChatML,
             "llama3" => ChatTemplate::Llama3,
@@ -127,45 +147,45 @@ fn build_first_turn(
 ) -> String {
     match fmt {
         ChatTemplate::ChatMLIm => {
-            let sys = system_opt.unwrap_or("You are a helpful assistant.");
+            let s_sys = system_opt.unwrap_or("You are a helpful assistant.");
             let mut s_out = String::new();
             if token_exists(tok, "<|begin_of_text|>") {
                 s_out.push_str("<|begin_of_text|>");
             }
             s_out.push_str(&format!(
                 "<|im_start|>system\n{}\n<|im_end|>\n<|im_start|>user\n{}\n<|im_end|>\n<|im_start|>assistant\n",
-                sys, user
+                s_sys, user
             ));
             s_out
         }
         ChatTemplate::ChatML => {
-            let sys = system_opt.unwrap_or("You are a helpful assistant.");
+            let s_sys = system_opt.unwrap_or("You are a helpful assistant.");
             format!(
                 "<|system|>\n{}\n\n<|user|>\n{}\n\n<|assistant|>\n",
-                sys, user
+                s_sys, user
             )
         }
         ChatTemplate::Llama3 => {
-            let sys = system_opt.unwrap_or("You are a helpful assistant.");
+            let s_sys = system_opt.unwrap_or("You are a helpful assistant.");
             format!(
                 "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{}\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{}\n<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
-                sys, user
+                s_sys, user
             )
         }
         ChatTemplate::Llama2 => {
-            let sys = system_opt.unwrap_or("You are a helpful assistant.");
-            format!("[INST] <<SYS>>\n{}\n<</SYS>>\n\n{} [/INST]\n", sys, user)
+            let s_sys = system_opt.unwrap_or("You are a helpful assistant.");
+            format!("[INST] <<SYS>>\n{}\n<</SYS>>\n\n{} [/INST]\n", s_sys, user)
         }
         ChatTemplate::Mistral => format!("[INST] {}\n[/INST]\n", user),
         ChatTemplate::Gemma => {
-            let sys = system_opt.unwrap_or("You are a helpful assistant.");
-            format!("system\n{}\nuser\n{}\nmodel\n", sys, user)
+            let s_sys = system_opt.unwrap_or("You are a helpful assistant.");
+            format!("system\n{}\nuser\n{}\nmodel\n", s_sys, user)
         }
         ChatTemplate::Alpaca => {
-            if let Some(sys) = system_opt {
+            if let Some(s_sys) = system_opt {
                 format!(
                     "### System:\n{}\n\n### Instruction:\n{}\n\n### Response:\n",
-                    sys, user
+                    s_sys, user
                 )
             } else {
                 format!("### Instruction:\n{}\n\n### Response:\n", user)
@@ -173,8 +193,8 @@ fn build_first_turn(
         }
         ChatTemplate::SimpleTags => {
             let mut s_out = String::new();
-            if let Some(sys) = system_opt {
-                s_out.push_str(&format!("<|system|>\n{}\n", sys));
+            if let Some(s_sys) = system_opt {
+                s_out.push_str(&format!("<|system|>\n{}\n", s_sys));
             }
             s_out.push_str(&format!("<|user|>\n{}\n<|assistant|>\n", user));
             s_out
@@ -228,8 +248,6 @@ fn env_or_default_stops(tok: &tokenizer::GgufTokenizer, fmt: ChatTemplate) -> Ve
     }
 }
 
-// ---------------- Stop-IDs ----------------
-
 fn compile_stop_id_sequences(tok: &tokenizer::GgufTokenizer, stop_str: &[String]) -> Vec<Vec<u32>> {
     let mut v_seqs: Vec<Vec<u32>> = Vec::new();
     for s_val in stop_str {
@@ -242,11 +260,17 @@ fn compile_stop_id_sequences(tok: &tokenizer::GgufTokenizer, stop_str: &[String]
     v_seqs
 }
 
-fn max_stop_len(v_stop_ids: &[Vec<u32>]) -> usize {
-    v_stop_ids.iter().map(|v| v.len()).max().unwrap_or(0)
+fn common_prefix_bytes(a: &str, b: &str) -> usize {
+    let mut n = 0usize;
+    for (ca, cb) in a.chars().zip(b.chars()) {
+        if ca == cb {
+            n += ca.len_utf8();
+        } else {
+            break;
+        }
+    }
+    n
 }
-
-// ---------------- Sampler-Fallback ----------------
 
 fn pick_top1(v_logits: &[f32], d_temp: f32) -> usize {
     let inv_t = if d_temp > 0.0 { 1.0 / d_temp } else { 1.0 };
@@ -262,27 +286,42 @@ fn pick_top1(v_logits: &[f32], d_temp: f32) -> usize {
     i_best
 }
 
-// ---------------- Backend-Trait ----------------
+// ---------------- Backend Trait ----------------
 
-trait LmBackend {
-    fn forward_tokens(&mut self, ids: &[u32]) -> Result<Vec<f32>, String>;
+#[async_trait]
+trait LmBackend: Send {
+    async fn forward_tokens(&mut self, ids: &[u32]) -> Result<Vec<f32>, String>;
     fn vocab_size(&self) -> usize;
 }
 
+#[async_trait]
 impl LmBackend for models_candle::CandleLlamaModel {
-    fn forward_tokens(&mut self, ids: &[u32]) -> Result<Vec<f32>, String> {
+    async fn forward_tokens(&mut self, ids: &[u32]) -> Result<Vec<f32>, String> {
         models_candle::CandleLlamaModel::forward_tokens(self, ids)
     }
+
     fn vocab_size(&self) -> usize {
         models_candle::CandleLlamaModel::vocab_size(self)
     }
 }
 
-fn build_backend() -> Result<Box<dyn LmBackend>, String> {
+#[async_trait]
+impl LmBackend for crate::models_p2p::P2pLlamaModel {
+    async fn forward_tokens(&mut self, ids: &[u32]) -> Result<Vec<f32>, String> {
+        self.forward_tokens_async(ids).await
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.vocab_size()
+    }
+}
+
+fn build_backend(o_peer_id: PeerId) -> Result<Box<dyn LmBackend>, String> {
     let s_weights =
         std::env::var("LLAMA_WEIGHTS").map_err(|_| "Env LLAMA_WEIGHTS fehlt".to_string())?;
     let s_config =
         std::env::var("LLAMA_CONFIG").map_err(|_| "Env LLAMA_CONFIG fehlt".to_string())?;
+    let s_backend = std::env::var("BACKEND").unwrap_or_else(|_| "local".to_string());
 
     let dt = match std::env::var("LLAMA_DTYPE")
         .unwrap_or_else(|_| "f32".to_string())
@@ -293,40 +332,46 @@ fn build_backend() -> Result<Box<dyn LmBackend>, String> {
         _ => candle::DType::F32,
     };
 
-    println!("RUNNING: Candle");
-    let m = models_candle::CandleLlamaModel::from_safetensors(&s_weights, &s_config, dt)?;
-    Ok(Box::new(m))
-}
+    println!("RUNNING: {}", s_backend);
 
-// ---------------- Streaming Helper ----------------
-
-fn common_prefix_bytes(a: &str, b: &str) -> usize {
-    let mut n = 0usize;
-    for (ca, cb) in a.chars().zip(b.chars()) {
-        if ca == cb {
-            n += ca.len_utf8();
-        } else {
-            break;
+    let o_backend: Box<dyn LmBackend> = match s_backend.as_str() {
+        "local" | "candle" => {
+            let o_mdl = models_candle::CandleLlamaModel::from_safetensors(&s_weights, &s_config, dt)?;
+            Box::new(o_mdl)
         }
-    }
-    n
+        "p2p" => {
+            let s_blocks_map_file =
+                std::env::var("BLOCKS_MAP").unwrap_or_else(|_| "blocks_map.json".to_string());
+            let s_model_name = std::env::var("MODEL_NAME").unwrap_or_else(|_| "llama".to_string());
+
+            let o_mdl = crate::models_p2p::P2pLlamaModel::from_safetensors(
+                &s_weights,
+                &s_config,
+                dt,
+                &s_blocks_map_file,
+                &s_model_name,
+                o_peer_id,
+            )?;
+            Box::new(o_mdl)
+        }
+        _ => {
+            let o_mdl = models_candle::CandleLlamaModel::from_safetensors(&s_weights, &s_config, dt)?;
+            Box::new(o_mdl)
+        }
+    };
+
+    Ok(o_backend)
 }
 
-// ---------------- Chat Tools ----------------
+// ---------------- Chat State ----------------
 
 #[derive(Clone)]
 struct ChatState {
     s_system_prompt: String,
     d_temp: f32,
     i_max_new: usize,
-    i_topk: usize,
-    d_topp: f32,
-    d_minp: f32,
-    d_rep_pen: f32,
-    i_rep_win: usize,
     b_echo_prompt: bool,
     b_debug_show_tokens: bool,
-    i_last_gen_tokens: usize,
 }
 
 fn default_chat_state() -> ChatState {
@@ -336,16 +381,11 @@ fn default_chat_state() -> ChatState {
         s_system_prompt,
         d_temp: env_f32("TEMP", 0.8),
         i_max_new: env_usize("MAX_NEW", 64),
-        i_topk: env_usize("TOPK", 40),
-        d_topp: env_f32("TOPP", 0.9),
-        d_minp: env_f32("MINP", 0.0),
-        d_rep_pen: env_f32("REP_PENALTY", 1.1),
-        i_rep_win: env_usize("REP_WINDOW", 256),
         b_echo_prompt: false,
         b_debug_show_tokens: false,
-        i_last_gen_tokens: 0,
     }
 }
+
 fn is_abort_space_pressed() -> Result<bool, String> {
     if event::poll(Duration::from_millis(0)).map_err(|e| e.to_string())? {
         if let Event::Key(k) = event::read().map_err(|e| e.to_string())? {
@@ -356,92 +396,20 @@ fn is_abort_space_pressed() -> Result<bool, String> {
     }
     Ok(false)
 }
+
 fn print_menu() {
     println!("------------------------------------------------------------");
     println!("Chat Menu");
     println!("exit                         beendet das programm");
     println!("help                         zeigt dieses menu");
+    println!("peers                        zeigt verbundene peers");
+    println!("connect <peer_id> <addr>     verbindet manuell zu peer");
     println!("Space                        bricht die laufende ausgabe ab");
     println!("------------------------------------------------------------");
-    println!("save <file>                  speichert kontext token ids");
-    println!("load <file>                  laedt kontext token ids");
-    println!("sys <text>                   setzt system prompt");
-    println!("show sys                     zeigt system prompt");
-    println!("temp <f32>                   setzt temperatur");
-    println!("topk <usize>                 setzt top k");
-    println!("topp <f32>                   setzt top p");
-    println!("minp <f32>                   setzt min p");
-    println!("maxnew <usize>               setzt max neue tokens");
-    println!("rep <pen> <win>              setzt repetition penalty und window");
-    println!("stats                        zeigt kontext und sampler");
-    println!("vocab                        zeigt vocab size");
-    println!("ctx                          zeigt kontext laenge");
-    println!("ctx pop <n>                  entfernt die letzten n tokens");
-    println!("ctx keep <n>                 behaelt nur die letzten n tokens");
-    println!("ctx head <n>                 zeigt die ersten n tokens als text");
-    println!("ctx tail <n>                 zeigt die letzten n tokens als text");
-    println!("tok <text>                   encodiert text und zeigt token ids");
-    println!("detok <ids>                  decodiert ids, format: 1,2,3");
-    println!("stop show                    zeigt stop strings aus env oder default");
-    println!("template show                zeigt erkanntes template");
-    println!("echo on|off                  zeigt prompt vor generation");
-    println!("show params                  zeigt sampler parameter");
-    println!("reset params                 setzt sampler auf env defaults");
-    println!("debug tokens on|off          zeigt token ids pro generation");
-    println!("bench <n> <text>             generiert n mal fuer test");
-    println!("------------------------------------------------------------");
-}
-
-fn try_parse_f32(s_val: &str) -> Option<f32> {
-    s_val.trim().parse::<f32>().ok()
-}
-
-fn try_parse_usize(s_val: &str) -> Option<usize> {
-    s_val.trim().parse::<usize>().ok()
-}
-
-fn parse_cmd_arg_rest(s_line: &str) -> (String, String) {
-    let mut it = s_line.splitn(2, ' ');
-    let s_cmd = it.next().unwrap_or("").trim().to_string();
-    let s_rest = it.next().unwrap_or("").trim().to_string();
-    (s_cmd, s_rest)
-}
-
-fn parse_two_args(s_line: &str) -> Option<(String, String)> {
-    let mut it = s_line.split_whitespace();
-    let s_a = it.next()?.to_string();
-    let s_b = it.next()?.to_string();
-    Some((s_a, s_b))
-}
-
-fn parse_three_args(s_line: &str) -> Option<(String, String, String)> {
-    let mut it = s_line.split_whitespace();
-    let s_a = it.next()?.to_string();
-    let s_b = it.next()?.to_string();
-    let s_c = it.next()?.to_string();
-    Some((s_a, s_b, s_c))
-}
-
-fn parse_ids_csv(s_ids: &str) -> Result<Vec<u32>, String> {
-    let mut v_ids: Vec<u32> = Vec::new();
-    for s_part in s_ids.split(',') {
-        let s_t = s_part.trim();
-        if s_t.is_empty() {
-            continue;
-        }
-        let i_val = s_t
-            .parse::<u32>()
-            .map_err(|_| "detok: ungueltige id liste".to_string())?;
-        v_ids.push(i_val);
-    }
-    if v_ids.is_empty() {
-        return Err("detok: keine ids".to_string());
-    }
-    Ok(v_ids)
 }
 
 fn is_safe_file_name(s_file: &str) -> bool {
-    if s_file.is_empty() {
+    if s_file.trim().is_empty() {
         return false;
     }
     if s_file.contains("..") {
@@ -468,8 +436,8 @@ fn save_ctx_to_file(s_file: &str, v_ctx_ids: &[u32]) -> Result<(), String> {
     }
 
     let mut s_out = String::new();
-    for (i, id) in v_ctx_ids.iter().enumerate() {
-        if i > 0 {
+    for (i_idx, id) in v_ctx_ids.iter().enumerate() {
+        if i_idx > 0 {
             s_out.push(',');
         }
         s_out.push_str(&id.to_string());
@@ -489,191 +457,365 @@ fn load_ctx_from_file(s_file: &str) -> Result<Vec<u32>, String> {
 
     let s_raw = std::fs::read_to_string(s_file)
         .map_err(|e| format!("load: lesen fehlgeschlagen: {}", e))?;
-    let v_ids = parse_ids_csv(&s_raw)?;
+
+    let mut v_ids: Vec<u32> = Vec::new();
+    for s_part in s_raw.split(',') {
+        let s_t = s_part.trim();
+        if s_t.is_empty() {
+            continue;
+        }
+        let i_val = s_t
+            .parse::<u32>()
+            .map_err(|_| "load: ungueltige id liste".to_string())?;
+        v_ids.push(i_val);
+    }
+    if v_ids.is_empty() {
+        return Err("load: keine ids".to_string());
+    }
+
     Ok(v_ids)
 }
 
-fn print_params(o_state: &ChatState) {
-    println!(
-        "temp={} maxnew={} topk={} topp={} minp={} rep_penalty={} rep_window={}",
-        o_state.d_temp,
-        o_state.i_max_new,
-        o_state.i_topk,
-        o_state.d_topp,
-        o_state.d_minp,
-        o_state.d_rep_pen,
-        o_state.i_rep_win
-    );
+// ---------------- P2P Auto Connect ----------------
+
+async fn auto_connect_route_peers(
+    o_rt: &crate::p2p_node::P2pRuntime,
+    o_blocks_map: &crate::p2p_blocks_map::BlocksMap,
+) -> Result<(), String> {
+    let s_model_name = env_string("MODEL_NAME", "llama");
+    let set_needed = o_blocks_map.needed_peers_for_model(&s_model_name);
+
+    for s_peer_id in set_needed {
+        if s_peer_id == o_blocks_map.s_self_peer_id {
+            continue;
+        }
+
+        let s_addr = match o_blocks_map.get_addr_for_peer(&s_peer_id) {
+            Some(v) => v,
+            None => {
+                return Err("blocks_map: addr fehlt fuer peer".to_string());
+            }
+        };
+
+        let o_msg = crate::p2p_node::SwarmControlMsg::ConnectPeer { s_peer_id, s_addr };
+        o_rt.o_ctl_tx
+            .send(o_msg)
+            .await
+            .map_err(|_| "auto connect: control channel closed".to_string())?;
+    }
+
+    Ok(())
 }
 
-fn reset_params_from_env(o_state: &mut ChatState) {
-    o_state.d_temp = env_f32("TEMP", 0.8);
-    o_state.i_max_new = env_usize("MAX_NEW", 64);
-    o_state.i_topk = env_usize("TOPK", 40);
-    o_state.d_topp = env_f32("TOPP", 0.9);
-    o_state.d_minp = env_f32("MINP", 0.0);
-    o_state.d_rep_pen = env_f32("REP_PENALTY", 1.1);
-    o_state.i_rep_win = env_usize("REP_WINDOW", 256);
+// ---------------- P2P Server Handler State ----------------
+
+struct P2pServerState {
+    o_model: Arc<crate::local_llama::LocalLlama>,
+    o_cache: Arc<Mutex<crate::local_llama::Cache>>,
+}
+type P2pServerStateRef = Arc<P2pServerState>;
+
+fn build_server_state_from_env() -> Result<P2pServerStateRef, String> {
+    let s_weights = std::env::var("LLAMA_WEIGHTS").map_err(|_| "LLAMA_WEIGHTS fehlt".to_string())?;
+    let s_config = std::env::var("LLAMA_CONFIG").map_err(|_| "LLAMA_CONFIG fehlt".to_string())?;
+
+    let e_dtype = match std::env::var("LLAMA_DTYPE")
+        .unwrap_or_else(|_| "f32".to_string())
+        .as_str()
+    {
+        "f16" => candle::DType::F16,
+        "bf16" => candle::DType::BF16,
+        _ => candle::DType::F32,
+    };
+
+    let o_dev = candle::Device::Cpu;
+
+    let v_cfg_bytes =
+        std::fs::read(&s_config).map_err(|e| format!("config json lesen fehlgeschlagen: {}", e))?;
+    let o_cfg_raw: crate::local_llama::LlamaConfig =
+        serde_json::from_slice(&v_cfg_bytes).map_err(|e| format!("config json parse: {}", e))?;
+    let o_config = o_cfg_raw.into_config(false);
+
+    let v_weight_files = crate::model_inspect::build_weight_files(&s_weights)?;
+    let o_vb = unsafe {
+        candle_nn::VarBuilder::from_mmaped_safetensors(&v_weight_files, e_dtype, &o_dev)
+            .map_err(|e| format!("safetensors mmap fehlgeschlagen: {}", e))?
+    };
+
+    let o_model = crate::local_llama::LocalLlama::load(o_vb, &o_config)
+        .map_err(|e| format!("llama load: {}", e))?;
+    let o_cache = crate::local_llama::Cache::new(true, e_dtype, &o_config, &o_dev)
+        .map_err(|e| format!("llama cache: {}", e))?;
+
+    Ok(Arc::new(P2pServerState {
+        o_model: Arc::new(o_model),
+        o_cache: Arc::new(Mutex::new(o_cache)),
+    }))
 }
 
-// ---------------- Chat-Loop ----------------
+fn make_error_response(s_err: &str) -> Result<Vec<u8>, String> {
+    let o_dummy = candle::Tensor::zeros((1, 1, 1), candle::DType::F32, &candle::Device::Cpu)
+        .map_err(|e| format!("server: dummy tensor: {}", e))?;
 
-// ------------------------------------------------------------
-// Chat Loop
-// Aenderung:
-// - raw mode aktiv fuer sofortige taste
-// - generation kann mit space abgebrochen werden
-//
-// Autor: Marcus Schlieper, ExpChat.ai
-// Historie:
-// - 2025-12-26 Marcus Schlieper: space abort
-// ------------------------------------------------------------
-fn chat_loop(
+    let o_resp = RunBlockResponse {
+        o_y: tensor_to_wire(&o_dummy).map_err(|e| format!("server: tensor_to_wire: {}", e))?,
+        s_error: s_err.to_string(),
+    };
+
+    bincode::serialize(&o_resp).map_err(|_| "server: bincode response encode fehlgeschlagen".to_string())
+}
+
+fn build_p2p_server_handler(o_state: P2pServerStateRef) -> crate::p2p_node::ServerHandler {
+    let o_state_outer = o_state.clone();
+
+    Arc::new(move |o_peer, v_req| {
+        let o_state_inner = o_state_outer.clone();
+
+        Box::pin(async move {
+            let o_req: crate::p2p_wire::RunBlockRequest = match bincode::deserialize(&v_req) {
+                Ok(v) => v,
+                Err(_) => return make_error_response("server: request decode fehlgeschlagen"),
+            };
+
+            let o_x = match wire_to_tensor(&o_req.o_x) {
+                Ok(v) => v,
+                Err(e) => return make_error_response(&format!("server: wire_to_tensor: {}", e)),
+            };
+
+            let o_y = {
+                let mut o_cache_guard = o_state_inner.o_cache.lock().await;
+
+                let o_llama = o_state_inner.o_model.inner_ref();
+                match o_llama.forward_one_block(&o_x, o_req.i_pos, o_req.i_block_no, &mut *o_cache_guard) {
+                    Ok(v) => v,
+                    Err(e) => return make_error_response(&format!("server: forward_one_block: {}", e)),
+                }
+            };
+
+            let o_resp = RunBlockResponse {
+                o_y: match tensor_to_wire(&o_y) {
+                    Ok(v) => v,
+                    Err(e) => return make_error_response(&format!("server: tensor_to_wire: {}", e)),
+                },
+                s_error: String::new(),
+            };
+
+            bincode::serialize(&o_resp).map_err(|_| "server: response encode fehlgeschlagen".to_string())
+        })
+    })
+}
+
+// ---------------- Chat Loop ----------------
+
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn enable() -> Result<Self, String> {
+        terminal::enable_raw_mode().map_err(|e| e.to_string())?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
+async fn chat_loop(
     tok: tokenizer::GgufTokenizer,
     mut ctx_ids: Vec<u32>,
     mut mdl: Box<dyn LmBackend>,
     fmt: ChatTemplate,
+    o_p2p_rt_opt: Option<crate::p2p_node::P2pRuntime>,
 ) -> Result<(), String> {
-    terminal::enable_raw_mode().map_err(|e| e.to_string())?;
+    let _o_raw_guard = RawModeGuard::enable()?;
 
-    let r_out = (|| -> Result<(), String> {
-        print_menu();
-        println!("Chat gestartet. Tippe help fuer menu.");
+    print_menu();
+    println!("Chat gestartet. Tippe help fuer menu.");
 
-        let mut rng_state: u64 = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64 ^ 0xC0FFEE_BAAD_F00D_u64)
-            .unwrap_or(0x1234_5678_9ABC_DEF0_u64);
+    let v_stop_str = env_or_default_stops(&tok, fmt);
+    let v_stop_ids = compile_stop_id_sequences(&tok, &v_stop_str);
 
-        let v_stop_str = env_or_default_stops(&tok, fmt);
-        let v_stop_ids = compile_stop_id_sequences(&tok, &v_stop_str);
+    let mut s_input = String::new();
 
-        let mut s_input = String::new();
+    loop {
+        terminal::disable_raw_mode().map_err(|e| e.to_string())?;
+        print!("> ");
+        io::stdout().flush().map_err(|e| e.to_string())?;
+        s_input.clear();
+        io::stdin().read_line(&mut s_input).map_err(|e| e.to_string())?;
+        terminal::enable_raw_mode().map_err(|e| e.to_string())?;
 
-        loop {
-            // raw mode: du kannst nicht normal read_line nutzen, weil enter nicht wie gewohnt geht.
-            // Loesung: wir bleiben fuer eingabe bei normal mode? Oder du nutzt eine eigene line editor.
-            // Minimal invasiv: raw mode nur waehrend generation aktivieren.
+        let s_line = s_input.trim();
+        if s_line.is_empty() {
+            continue;
+        }
 
-            // daher: hier raw mode kurz aus, eingabe lesen, dann wieder an
-            terminal::disable_raw_mode().map_err(|e| e.to_string())?;
-            print!("> ");
-            io::stdout().flush().map_err(|e| e.to_string())?;
-            s_input.clear();
-            io::stdin()
-                .read_line(&mut s_input)
-                .map_err(|e| e.to_string())?;
-            terminal::enable_raw_mode().map_err(|e| e.to_string())?;
+        let s_line_lc = s_line.to_lowercase();
 
-            let s_line = s_input.trim();
-            if s_line.is_empty() {
-                continue;
-            }
+        if s_line_lc == "exit" {
+            println!("Tschuess");
+            break;
+        }
+        if s_line_lc == "help" {
+            print_menu();
+            continue;
+        }
 
-            let s_line_lc = s_line.to_lowercase();
-            if s_line_lc == "exit" {
-                println!("Tschuess");
-                break;
-            }
-            if s_line_lc == "help" {
-                print_menu();
-                continue;
-            }
-
-            // prompt bauen wie gehabt
-            if ctx_ids.is_empty() {
-                if let Some(bos) = tok.bos_id() {
-                    ctx_ids.push(bos);
+        if s_line_lc == "peers" {
+            if let Some(o_rt) = &o_p2p_rt_opt {
+                let v_peers = crate::p2p_node::get_connected_peers(o_rt).await;
+                println!("------------------------------------------------------------");
+                println!("connected peers count: {}", v_peers.len());
+                for o_peer in v_peers {
+                    println!("peer: {}", o_peer);
                 }
-                let s_sys = std::env::var("SYSTEM_PROMPT")
-                    .unwrap_or_else(|_| "You are a helpful assistant.".to_string());
-                let s_first = build_first_turn(fmt, &tok, Some(&s_sys), s_line);
-                let ids = tok.encode(&s_first, true)?;
-                ctx_ids.extend_from_slice(&ids);
+                println!("------------------------------------------------------------");
             } else {
-                let s_next = build_next_turn(fmt, s_line);
-                let ids = tok.encode(&s_next, false)?;
-                ctx_ids.extend_from_slice(&ids);
+                println!("p2p ist nicht aktiv");
             }
+            continue;
+        }
 
-            // generation
-            let mut pending: Vec<u32> = Vec::new();
-            let mut s_printed = String::new();
-            let mut printed_any = false;
+        if s_line_lc.starts_with("connect ") {
+            if let Some(o_rt) = &o_p2p_rt_opt {
+                let mut it = s_line.split_whitespace();
+                let _ = it.next();
+                let s_peer_id = it.next().unwrap_or("").trim().to_string();
+                let s_addr = it.next().unwrap_or("").trim().to_string();
 
-            for _step in 0..env_usize("MAX_NEW", 64) {
-                // Abbruch mit Space
-                if is_abort_space_pressed()? {
-                    println!();
-                    println!("[abbruch durch space]");
-                    println!();
-                    break;
+                if s_peer_id.is_empty() || s_addr.is_empty() {
+                    println!("connect usage: connect peer_id addr");
+                    continue;
                 }
 
-                let v_logits = mdl.forward_tokens(&ctx_ids)?;
-                let next_idx = pick_top1(&v_logits, env_f32("TEMP", 0.8)) as u32;
-
-                ctx_ids.push(next_idx);
-                pending.push(next_idx);
-
-                // streaming stabil
-                let s_all = tok.decode(&pending, true).unwrap_or_default();
-                let i_cp = common_prefix_bytes(&s_printed, &s_all);
-                let new_bytes = &s_all.as_bytes()[i_cp..];
-                if !new_bytes.is_empty() {
-                    if let Ok(new_str) = std::str::from_utf8(new_bytes) {
-                        print!("{}", new_str);
-                        io::stdout().flush().map_err(|e| e.to_string())?;
-                        printed_any = true;
-                    }
+                let o_msg = crate::p2p_node::SwarmControlMsg::ConnectPeer { s_peer_id, s_addr };
+                if o_rt.o_ctl_tx.send(o_msg).await.is_err() {
+                    println!("connect: swarm control channel closed");
                 }
-                s_printed = s_all;
-
-                // stop ids check wie gehabt (hier kurz gelassen)
-                for seq in &v_stop_ids {
-                    let n = seq.len();
-                    if n == 0 || ctx_ids.len() < n {
-                        continue;
-                    }
-                    let tail = &ctx_ids[ctx_ids.len() - n..];
-                    if tail == seq.as_slice() {
-                        println!();
-                        println!();
-                        pending.clear();
-                        s_printed.clear();
-                        break;
-                    }
-                }
-            }
-
-            if !printed_any {
-                println!("[kein token erzeugt]");
+                continue;
+            } else {
+                println!("p2p ist nicht aktiv");
+                continue;
             }
         }
 
-        Ok(())
-    })();
+        if ctx_ids.is_empty() {
+            if let Some(bos) = tok.bos_id() {
+                ctx_ids.push(bos);
+            }
+            let s_sys = std::env::var("SYSTEM_PROMPT")
+                .unwrap_or_else(|_| "You are a helpful assistant.".to_string());
+            let s_first = build_first_turn(fmt, &tok, Some(&s_sys), s_line);
+            let ids = tok.encode(&s_first, true)?;
+            ctx_ids.extend_from_slice(&ids);
+        } else {
+            let s_next = build_next_turn(fmt, s_line);
+            let ids = tok.encode(&s_next, false)?;
+            ctx_ids.extend_from_slice(&ids);
+        }
 
-    terminal::disable_raw_mode().map_err(|e| e.to_string())?;
-    r_out
+        let mut pending: Vec<u32> = Vec::new();
+        let mut s_printed = String::new();
+        let mut printed_any = false;
+
+        for _step in 0..env_usize("MAX_NEW", 64) {
+            if is_abort_space_pressed()? {
+                println!();
+                println!("[abbruch durch space]");
+                println!();
+                break;
+            }
+
+            let v_logits = mdl.forward_tokens(&ctx_ids).await?;
+            let next_idx = pick_top1(&v_logits, env_f32("TEMP", 0.8)) as u32;
+
+            ctx_ids.push(next_idx);
+            pending.push(next_idx);
+
+            let s_all = tok.decode(&pending, true).unwrap_or_default();
+            let i_cp = common_prefix_bytes(&s_printed, &s_all);
+            let new_bytes = &s_all.as_bytes()[i_cp..];
+            if !new_bytes.is_empty() {
+                if let Ok(new_str) = std::str::from_utf8(new_bytes) {
+                    print!("{}", new_str);
+                    io::stdout().flush().map_err(|e| e.to_string())?;
+                    printed_any = true;
+                }
+            }
+            s_printed = s_all;
+
+            for seq in &v_stop_ids {
+                let n = seq.len();
+                if n == 0 || ctx_ids.len() < n {
+                    continue;
+                }
+                let tail = &ctx_ids[ctx_ids.len() - n..];
+                if tail == seq.as_slice() {
+                    println!();
+                    println!();
+                    pending.clear();
+                    s_printed.clear();
+                    break;
+                }
+            }
+        }
+
+        if !printed_any {
+            println!("[kein token erzeugt]");
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------- main ----------------
 
-fn main() -> Result<(), String> {
+#[tokio::main]
+async fn main() -> Result<(), String> {
+    let i_p2p_port = env_u16("P2P_PORT", 4001);
+
+    let s_blocks_map_file = std::env::var("BLOCKS_MAP").unwrap_or_else(|_| "blocks_map.json".to_string());
+    let s_peer_key_file = std::env::var("PEER_KEY_FILE").unwrap_or_else(|_| "peer_key.bin".to_string());
+
+    let (o_keypair, o_peer_id, _o_map) = crate::p2p_identity::init_peer_identity(&s_blocks_map_file, &s_peer_key_file)?;
+    println!("peer id: {}", o_peer_id);
+
+    let (o_p2p_rt, o_swarm, o_rx, o_ctl_rx) = crate::p2p_node::build_runtime(i_p2p_port, o_keypair)?;
+    let o_connected_peers = o_p2p_rt.o_connected_peers.clone();
+
+    let o_server_state = build_server_state_from_env()?;
+    let o_server_handler: crate::p2p_node::ServerHandler = build_p2p_server_handler(o_server_state);
+
+    crate::p2p_runtime_handle::set_p2p_runtime(o_p2p_rt.clone())?;
+
+    crate::p2p_node::spawn_swarm_task(
+        o_swarm,
+        o_rx,
+        o_ctl_rx,
+        o_server_handler,
+        o_connected_peers,
+    );
+
+    println!("p2p peer id: {}", o_p2p_rt.o_self_peer_id);
+    println!("p2p listen tcp port: {}", i_p2p_port);
+
+    let o_blocks_map = crate::p2p_blocks_map::BlocksMap::from_file(&s_blocks_map_file)?;
+    if std::env::var("BACKEND").unwrap_or_else(|_| "local".to_string()) == "p2p" {
+        auto_connect_route_peers(&o_p2p_rt, &o_blocks_map).await?;
+    }
+
     let s_tok_json = std::env::var("TOKENIZER_JSON")
         .map_err(|_| "Bitte TOKENIZER_JSON auf tokenizer.json setzen".to_string())?;
     let o_tok = tokenizer::load_tokenizer_from_json_force(&s_tok_json)
         .map_err(|e| format!("Tokenizer Load Fehler: {}", e))?;
 
-    let mut o_backend = build_backend()?;
+    let mut o_backend = build_backend(o_peer_id)?;
     println!("Vokabular (Backend): {}", o_backend.vocab_size());
 
     let e_fmt = detect_chat_template(&o_tok);
-    if debug_on() {
-        println!("[CHK] BOS={:?} | EOS={:?}", o_tok.bos_id(), o_tok.eos_id());
-        println!("[CHK] DETECTED_TEMPLATE = {:?}", e_fmt);
-    }
+    let o_p2p_rt_opt = Some(o_p2p_rt.clone());
 
-    chat_loop(o_tok, Vec::new(), o_backend, e_fmt)
+    chat_loop(o_tok, Vec::new(), o_backend, e_fmt, o_p2p_rt_opt).await
 }

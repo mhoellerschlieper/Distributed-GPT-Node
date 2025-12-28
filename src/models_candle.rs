@@ -10,8 +10,10 @@
 // - 2025-12-26 Marcus Schlieper: modell report einbau
 // ------------------------------------------------------------
 
-use crate::local_llama::{Cache, Config, LlamaConfig, LocalLlama};
 use crate::model_inspect::print_model_report_candle;
+
+use crate::local_llama::{Cache, Config, LlamaConfig, LocalLlama};
+use async_trait::async_trait;
 
 use candle::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
@@ -38,7 +40,7 @@ impl CandleLlamaModel {
     ) -> Result<Self, String> {
         let dev = Device::Cpu;
 
-        print_model_report_candle(weights_path, config_json)?;
+        // print_model_report_candle(weights_path, config_json)?;
 
         let cfg_bytes = std::fs::read(config_json)
             .map_err(|e| format!("config json lesen fehlgeschlagen: {}", e))?;
