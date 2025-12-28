@@ -288,14 +288,14 @@ pub fn spawn_swarm_task(
                                             let mut set_peers = o_connected_peers.lock().await;
                                             set_peers.insert(peer_id);
                                         }
-                                        print_connected_peers(&o_connected_peers).await;
+                                        //print_connected_peers(&o_connected_peers).await;
                                     }
                                     SwarmEvent::ConnectionClosed { peer_id, .. } => {
                                         {
                                             let mut set_peers = o_connected_peers.lock().await;
                                             set_peers.remove(&peer_id);
                                         }
-                                        print_connected_peers(&o_connected_peers).await;
+                                        //print_connected_peers(&o_connected_peers).await;
                                     }
 
                                     SwarmEvent::Behaviour(P2pBehaviourEvent::Mdns(mdns::Event::Discovered(v_list))) => {

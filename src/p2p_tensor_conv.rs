@@ -15,7 +15,11 @@ use crate::p2p_wire::{WireDType, WireTensor};
 use candle::{DType, Device, Tensor};
 
 pub fn tensor_to_wire(o_x: &Tensor) -> Result<WireTensor, String> {
-    let v_shape = o_x.dims().iter().map(|&d| d as usize).collect::<Vec<usize>>();
+    let v_shape = o_x
+        .dims()
+        .iter()
+        .map(|&d| d as usize)
+        .collect::<Vec<usize>>();
 
     let e_dtype = match o_x.dtype() {
         DType::F32 => WireDType::F32,
@@ -60,9 +64,11 @@ pub fn wire_to_tensor(o_w: &WireTensor) -> Result<Tensor, String> {
         .map_err(|e| format!("reshape: {}", e))?;
 
     match o_w.e_dtype {
-        WireDType::F32 => Ok(o_t),
+        WireDType::F32 => o_t.to_dtype(DType::F32).map_err(|e| e.to_string()),
         WireDType::F16 => o_t.to_dtype(DType::F16).map_err(|e| e.to_string()),
         WireDType::BF16 => o_t.to_dtype(DType::BF16).map_err(|e| e.to_string()),
+        WireDType::I64 => o_t.to_dtype(DType::I64).map_err(|e| e.to_string()),
+        WireDType::U32 => o_t.to_dtype(DType::U32).map_err(|e| e.to_string()),
     }
 }
 

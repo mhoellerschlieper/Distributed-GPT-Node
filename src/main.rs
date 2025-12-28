@@ -616,6 +616,14 @@ impl RawModeGuard {
     }
 }
 
+fn build_session_id() -> String {
+    let i_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    format!("sess_{}", i_now)
+}
+
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let _ = terminal::disable_raw_mode();
