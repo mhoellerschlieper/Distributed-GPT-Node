@@ -336,7 +336,8 @@ fn build_backend(o_peer_id: PeerId) -> Result<Box<dyn LmBackend>, String> {
 
     let o_backend: Box<dyn LmBackend> = match s_backend.as_str() {
         "local" | "candle" => {
-            let o_mdl = models_candle::CandleLlamaModel::from_safetensors(&s_weights, &s_config, dt)?;
+            let o_mdl =
+                models_candle::CandleLlamaModel::from_safetensors(&s_weights, &s_config, dt)?;
             Box::new(o_mdl)
         }
         "p2p" => {
@@ -355,7 +356,8 @@ fn build_backend(o_peer_id: PeerId) -> Result<Box<dyn LmBackend>, String> {
             Box::new(o_mdl)
         }
         _ => {
-            let o_mdl = models_candle::CandleLlamaModel::from_safetensors(&s_weights, &s_config, dt)?;
+            let o_mdl =
+                models_candle::CandleLlamaModel::from_safetensors(&s_weights, &s_config, dt)?;
             Box::new(o_mdl)
         }
     };
@@ -516,7 +518,8 @@ struct P2pServerState {
 type P2pServerStateRef = Arc<P2pServerState>;
 
 fn build_server_state_from_env() -> Result<P2pServerStateRef, String> {
-    let s_weights = std::env::var("LLAMA_WEIGHTS").map_err(|_| "LLAMA_WEIGHTS fehlt".to_string())?;
+    let s_weights =
+        std::env::var("LLAMA_WEIGHTS").map_err(|_| "LLAMA_WEIGHTS fehlt".to_string())?;
     let s_config = std::env::var("LLAMA_CONFIG").map_err(|_| "LLAMA_CONFIG fehlt".to_string())?;
 
     let e_dtype = match std::env::var("LLAMA_DTYPE")
@@ -562,7 +565,8 @@ fn make_error_response(s_err: &str) -> Result<Vec<u8>, String> {
         s_error: s_err.to_string(),
     };
 
-    bincode::serialize(&o_resp).map_err(|_| "server: bincode response encode fehlgeschlagen".to_string())
+    bincode::serialize(&o_resp)
+        .map_err(|_| "server: bincode response encode fehlgeschlagen".to_string())
 }
 
 fn build_p2p_server_handler(o_state: P2pServerStateRef) -> crate::p2p_node::ServerHandler {
@@ -586,21 +590,31 @@ fn build_p2p_server_handler(o_state: P2pServerStateRef) -> crate::p2p_node::Serv
                 let mut o_cache_guard = o_state_inner.o_cache.lock().await;
 
                 let o_llama = o_state_inner.o_model.inner_ref();
-                match o_llama.forward_one_block(&o_x, o_req.i_pos, o_req.i_block_no, &mut *o_cache_guard) {
+                match o_llama.forward_one_block(
+                    &o_x,
+                    o_req.i_pos,
+                    o_req.i_block_no,
+                    &mut *o_cache_guard,
+                ) {
                     Ok(v) => v,
-                    Err(e) => return make_error_response(&format!("server: forward_one_block: {}", e)),
+                    Err(e) => {
+                        return make_error_response(&format!("server: forward_one_block: {}", e))
+                    }
                 }
             };
 
             let o_resp = RunBlockResponse {
                 o_y: match tensor_to_wire(&o_y) {
                     Ok(v) => v,
-                    Err(e) => return make_error_response(&format!("server: tensor_to_wire: {}", e)),
+                    Err(e) => {
+                        return make_error_response(&format!("server: tensor_to_wire: {}", e))
+                    }
                 },
                 s_error: String::new(),
             };
 
-            bincode::serialize(&o_resp).map_err(|_| "server: response encode fehlgeschlagen".to_string())
+            bincode::serialize(&o_resp)
+                .map_err(|_| "server: response encode fehlgeschlagen".to_string())
         })
     })
 }
@@ -630,6 +644,43 @@ impl Drop for RawModeGuard {
     }
 }
 
+fn set_env_if_missing(s_key: &str, s_val: &str) {
+    if std::env::var(s_key).is_err() {
+        std::env::set_var(s_key, s_val);
+    }
+}
+
+fn apply_blocks_map_to_env(o_map: &crate::p2p_blocks_map::BlocksMap) -> Result<(), String> {
+    for (s_key, s_val) in &o_map.map_parameters {
+        set_env_if_missing(s_key, s_val);
+    }
+
+    let s_model_name = std::env::var("MODEL_NAME").unwrap_or_else(|_| "llama".to_string());
+    if let Some(o_m) = o_map.get_model_settings(&s_model_name) {
+        if let Some(s_v) = o_m.CHAT_TEMPLATE {
+            set_env_if_missing("CHAT_TEMPLATE", &s_v);
+        }
+        if let Some(s_v) = o_m.STOP {
+            set_env_if_missing("STOP", &s_v);
+        }
+
+        if let Some(s_v) = o_m.TOKENIZER_JSON {
+            set_env_if_missing("TOKENIZER_JSON", &s_v);
+        }
+        if let Some(s_v) = o_m.LLAMA_WEIGHTS {
+            set_env_if_missing("LLAMA_WEIGHTS", &s_v);
+        }
+        if let Some(s_v) = o_m.LLAMA_CONFIG {
+            set_env_if_missing("LLAMA_CONFIG", &s_v);
+        }
+        if let Some(s_v) = o_m.LLAMA_DTYPE {
+            set_env_if_missing("LLAMA_DTYPE", &s_v);
+        }
+    }
+
+    Ok(())
+}
+
 async fn chat_loop(
     tok: tokenizer::GgufTokenizer,
     mut ctx_ids: Vec<u32>,
@@ -652,7 +703,9 @@ async fn chat_loop(
         print!("> ");
         io::stdout().flush().map_err(|e| e.to_string())?;
         s_input.clear();
-        io::stdin().read_line(&mut s_input).map_err(|e| e.to_string())?;
+        io::stdin()
+            .read_line(&mut s_input)
+            .map_err(|e| e.to_string())?;
         terminal::enable_raw_mode().map_err(|e| e.to_string())?;
 
         let s_line = s_input.trim();
@@ -782,15 +835,23 @@ async fn chat_loop(
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
+    let s_blocks_map_file =
+        std::env::var("BLOCKS_MAP").unwrap_or_else(|_| "blocks_map.json".to_string());
+    let s_peer_key_file =
+        std::env::var("PEER_KEY_FILE").unwrap_or_else(|_| "peer_key.bin".to_string());
+
+    let o_blocks_map = crate::p2p_blocks_map::BlocksMap::from_file(&s_blocks_map_file)?;
+    apply_blocks_map_to_env(&o_blocks_map)?;
+
+    // jetzt erst env_u16("P2P_PORT", ...) lesen
     let i_p2p_port = env_u16("P2P_PORT", 4001);
 
-    let s_blocks_map_file = std::env::var("BLOCKS_MAP").unwrap_or_else(|_| "blocks_map.json".to_string());
-    let s_peer_key_file = std::env::var("PEER_KEY_FILE").unwrap_or_else(|_| "peer_key.bin".to_string());
-
-    let (o_keypair, o_peer_id, _o_map) = crate::p2p_identity::init_peer_identity(&s_blocks_map_file, &s_peer_key_file)?;
+    let (o_keypair, o_peer_id, _o_map) =
+        crate::p2p_identity::init_peer_identity(&s_blocks_map_file, &s_peer_key_file)?;
     println!("peer id: {}", o_peer_id);
 
-    let (o_p2p_rt, o_swarm, o_rx, o_ctl_rx) = crate::p2p_node::build_runtime(i_p2p_port, o_keypair)?;
+    let (o_p2p_rt, o_swarm, o_rx, o_ctl_rx) =
+        crate::p2p_node::build_runtime(i_p2p_port, o_keypair)?;
     let o_connected_peers = o_p2p_rt.o_connected_peers.clone();
 
     let o_server_state = build_server_state_from_env()?;
@@ -798,13 +859,7 @@ async fn main() -> Result<(), String> {
 
     crate::p2p_runtime_handle::set_p2p_runtime(o_p2p_rt.clone())?;
 
-    crate::p2p_node::spawn_swarm_task(
-        o_swarm,
-        o_rx,
-        o_ctl_rx,
-        o_server_handler,
-        o_connected_peers,
-    );
+    crate::p2p_node::spawn_swarm_task(o_swarm, o_rx, o_ctl_rx, o_server_handler, o_connected_peers);
 
     println!("p2p peer id: {}", o_p2p_rt.o_self_peer_id);
     println!("p2p listen tcp port: {}", i_p2p_port);

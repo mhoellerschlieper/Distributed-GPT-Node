@@ -1,6 +1,19 @@
 {
   "self_peer_id": "12D3KooWFQrhmJ9hnkWgYevsVWDowqy3WURtfr4mX7Qh73C21eVZ",
+  "parameters":{ 
+	    "P2P_PORT": "4002",
+	    "DEBUG_MODEL":"0"
+  },
   
+  "models":[
+      {"model_name": "llama", "CHAT_TEMPLATE":"Llama3","STOP":"<|eot_id|>",
+      "TOKENIZER_JSON":"D:\\models\\Llama-3.2-3B-I\tokenizer.json",
+      "LLAMA_WEIGHTS":"d:\\odels\\Llama-3.2-3B-I\\model.safetensors.index.json",
+      "LLAMA_CONFIG":"D:\\models\\Llama-3.2-3B-I\\config.json",
+      "LLAMA_DTYPE":"f16"
+      }
+   ],
+   
   "peers":[
 	{ "peer_id": "12D3KooWFQrhmJ9hnkWgYevsVWDowqy3WURtfr4mX7Qh73C21eVZ", "addr": "/ip4/127.0.0.1/tcp/4002" },
 	{ "peer_id": "12D3KooWPhzUeJwg9QFPUQx21k9org1wZ9srBtwUdbV9R1E1e62w", "addr": "/ip4/127.0.0.1/tcp/4001" }

@@ -1,14 +1,15 @@
 // src/p2p_blocks_map.rs
 // ------------------------------------------------------------
-// Blocks Map plus Peer Adressen
+// Blocks Map plus peer list plus parameters and models
 //
 // Ziel
-// - blocks_map.json enthaelt peers (peer_id plus addr) und routes
-// - benoetigte peers fuer ein model werden berechnet
+// - blocks_map json enthaelt peers, routes, parameters und models
+// - parameters und model settings koennen env variablen ersetzen
 //
 // Autor: Marcus Schlieper, ExpChat.ai
 // Historie
-// - 2025-12-28 Marcus Schlieper: peers und auto connect basis
+// - 2025-12-28 Marcus Schlieper: peers und routes basis
+// - 2025-12-28 Marcus Schlieper: parameters und models hinzugefuegt
 // ------------------------------------------------------------
 
 use serde::{Deserialize, Serialize};
@@ -28,10 +29,27 @@ pub struct BlockRoute {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelSettings {
+    pub model_name: String,
+
+    pub CHAT_TEMPLATE: Option<String>,
+    pub STOP: Option<String>,
+
+    pub TOKENIZER_JSON: Option<String>,
+    pub LLAMA_WEIGHTS: Option<String>,
+    pub LLAMA_CONFIG: Option<String>,
+    pub LLAMA_DTYPE: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlocksMapFile {
     pub self_peer_id: String,
+
     pub peers: Vec<PeerEntry>,
     pub routes: Vec<BlockRoute>,
+
+    pub parameters: Option<HashMap<String, serde_json::Value>>,
+    pub models: Option<Vec<ModelSettings>>,
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +57,9 @@ pub struct BlocksMap {
     pub s_self_peer_id: String,
     pub map_peer_addr: HashMap<String, String>,
     pub map_routes: HashMap<(String, usize), String>,
+
+    pub map_parameters: HashMap<String, String>,
+    pub v_models: Vec<ModelSettings>,
 }
 
 impl BlocksMap {
@@ -65,10 +86,31 @@ impl BlocksMap {
             map_routes.insert((o_r.model_name.clone(), o_r.block_no), o_r.peer_id.clone());
         }
 
+        let mut map_parameters: HashMap<String, String> = HashMap::new();
+        if let Some(o_params) = &o_file.parameters {
+            for (s_key, o_val) in o_params {
+                let s_val = match o_val {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    serde_json::Value::Bool(b) => {
+                        if *b { "1".to_string() } else { "0".to_string() }
+                    }
+                    _ => {
+                        return Err("blocks_map parameters: ungueltiger werttyp".to_string());
+                    }
+                };
+                map_parameters.insert(s_key.clone(), s_val);
+            }
+        }
+
+        let v_models = o_file.models.unwrap_or_default();
+
         Ok(Self {
             s_self_peer_id: o_file.self_peer_id,
             map_peer_addr,
             map_routes,
+            map_parameters,
+            v_models,
         })
     }
 
@@ -90,5 +132,14 @@ impl BlocksMap {
             }
         }
         set_out
+    }
+
+    pub fn get_model_settings(&self, s_model_name: &str) -> Option<ModelSettings> {
+        for o_m in &self.v_models {
+            if o_m.model_name == s_model_name {
+                return Some(o_m.clone());
+            }
+        }
+        None
     }
 }
