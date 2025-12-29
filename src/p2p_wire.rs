@@ -28,7 +28,7 @@ pub struct SessionClearResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunBlockRequest {
     pub s_model_name: String,
-    pub i_block_no: usize,
+    pub v_block_nos: Vec<usize>,
     pub i_pos: usize,
     pub s_session_id: String,
     pub o_x: WireTensor,
@@ -40,14 +40,7 @@ pub struct RunBlockResponse {
     pub s_error: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunBlocksRequest {
-    pub s_model_name: String,
-    pub v_block_nos: Vec<usize>,
-    pub i_pos: usize,
-    pub s_session_id: String,
-    pub o_x: WireTensor,
-}
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunBlocksResponse {

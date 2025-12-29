@@ -15,9 +15,10 @@ use candle::{Result, Tensor};
 use libp2p::PeerId;
 
 use crate::p2p_tensor_conv::{tensor_to_wire, wire_to_tensor};
-use crate::p2p_wire::{RunBlocksRequest, RunBlocksResponse, RunBlockRequest, RunBlockResponse};
+use crate::p2p_wire::{RunBlocksResponse, RunBlockRequest, RunBlockResponse};
 use crate::p2p_runtime_handle::with_p2p_runtime;
 
+/*
 pub async fn send_block_run_and_wait(
     o_peer_id: PeerId,
     s_model_name: &str,
@@ -51,7 +52,7 @@ pub async fn send_block_run_and_wait(
     let o_y = wire_to_tensor(&o_resp.o_y).map_err(|e| candle::Error::Msg(e))?;
     Ok(o_y)
 }
-
+*/
 pub async fn send_blocks_run_and_wait(
     o_peer_id: PeerId,
     s_model_name: &str,
@@ -64,7 +65,7 @@ pub async fn send_blocks_run_and_wait(
         return Err(candle::Error::Msg("send_blocks: v_block_nos ist leer".to_string()));
     }
 
-    let o_req = RunBlocksRequest {
+    let o_req = RunBlockRequest {
         s_model_name: s_model_name.to_string(),
         v_block_nos: v_block_nos.to_vec(),
         i_pos,

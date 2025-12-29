@@ -586,25 +586,33 @@ fn build_p2p_server_handler(o_state: P2pServerStateRef) -> crate::p2p_node::Serv
                 Err(e) => return make_error_response(&format!("server: wire_to_tensor: {}", e)),
             };
 
-            let o_y = {
-                let mut o_cache_guard = o_state_inner.o_cache.lock().await;
+            let mut calc_x = o_x;
 
-                let o_llama = o_state_inner.o_model.inner_ref();
-                match o_llama.forward_one_block(
-                    &o_x,
-                    o_req.i_pos,
-                    o_req.i_block_no,
-                    &mut *o_cache_guard,
-                ) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        return make_error_response(&format!("server: forward_one_block: {}", e))
+            // zusammenhängende Blöcke ausführen
+            for i_block_no in o_req.v_block_nos {
+                calc_x = {
+                    let mut o_cache_guard = o_state_inner.o_cache.lock().await;
+
+                    let o_llama = o_state_inner.o_model.inner_ref();
+                    match o_llama.forward_one_block(
+                        &calc_x,
+                        o_req.i_pos,
+                        i_block_no,
+                        &mut *o_cache_guard,
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return make_error_response(&format!(
+                                "server: forward_one_block: {}",
+                                e
+                            ))
+                        }
                     }
-                }
-            };
+                };
+            }
 
             let o_resp = RunBlockResponse {
-                o_y: match tensor_to_wire(&o_y) {
+                o_y: match tensor_to_wire(&calc_x) {
                     Ok(v) => v,
                     Err(e) => {
                         return make_error_response(&format!("server: tensor_to_wire: {}", e))
@@ -789,7 +797,7 @@ async fn chat_loop(
                 break;
             }
 
-            // alles 
+            // alles
             let v_logits = match mdl.forward_tokens(&ctx_ids).await {
                 Ok(v) => v,
                 Err(s_err) => {
