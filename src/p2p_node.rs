@@ -31,6 +31,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot, Mutex};
+use serde::{Deserialize, Serialize};
 
 // ---------------- Types ----------------
 
@@ -48,6 +49,14 @@ pub type ServerHandler = Arc<
 
 const REQUEST_TIMEOUT_SEC: u64 = 10;
 
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PeerStat {
+    pub i_calls: u64,
+    pub i_errors: u64,
+    pub i_bytes_out: u64,
+    pub i_bytes_in: u64,
+}
 // ---------------- Behaviour ----------------
 
 #[derive(Debug)]
@@ -86,13 +95,14 @@ pub struct OutboundCall {
     pub v_req: Vec<u8>,
     pub o_tx: oneshot::Sender<Result<Vec<u8>, String>>,
 }
-
 #[derive(Clone)]
 pub struct P2pRuntime {
     pub o_tx: mpsc::Sender<OutboundCall>,
     pub o_self_peer_id: PeerId,
     pub o_connected_peers: Arc<Mutex<HashSet<PeerId>>>,
     pub o_ctl_tx: mpsc::Sender<SwarmControlMsg>,
+
+    pub o_peer_stats: Arc<Mutex<HashMap<PeerId, PeerStat>>>,
 }
 
 pub fn build_runtime(
@@ -165,12 +175,17 @@ pub fn build_runtime(
 
     let o_connected_peers: Arc<Mutex<HashSet<PeerId>>> = Arc::new(Mutex::new(HashSet::new()));
 
+    let o_peer_stats: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::HashMap<libp2p::PeerId, PeerStat>>,
+    > = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
     Ok((
         P2pRuntime {
             o_tx,
             o_self_peer_id: o_peer_id,
             o_connected_peers: o_connected_peers.clone(),
             o_ctl_tx,
+            o_peer_stats: o_peer_stats.clone(),
         },
         o_swarm,
         o_rx,
@@ -213,130 +228,130 @@ pub fn spawn_swarm_task(
 
         loop {
             tokio::select! {
-                            o_ctl_opt = o_ctl_rx.recv() => {
-                                if let Some(o_ctl) = o_ctl_opt {
-                                    match o_ctl {
-                                        SwarmControlMsg::RegisterPeerAddr { s_peer_id, s_addr } => {
-                                            let o_peer_id = match parse_peer_id(&s_peer_id) {
-                                                Ok(v) => v,
-                                                Err(e) => { println!("register: {}", e); continue; }
-                                            };
-                                            let o_addr = match parse_multiaddr(&s_addr) {
-                                                Ok(v) => v,
-                                                Err(e) => { println!("register: {}", e); continue; }
-                                            };
-                                            o_swarm.behaviour_mut().rr.add_address(&o_peer_id, o_addr);
-                                            println!("register: peer={} addr gesetzt", s_peer_id);
-                                        }
-                                        SwarmControlMsg::ConnectPeer { s_peer_id, s_addr } => {
-                                            let o_peer_id = match parse_peer_id(&s_peer_id) {
-                                                Ok(v) => v,
-                                                Err(e) => { println!("connect: {}", e); continue; }
-                                            };
-                                            let o_addr = match parse_multiaddr(&s_addr) {
-                                                Ok(v) => v,
-                                                Err(e) => { println!("connect: {}", e); continue; }
-                                            };
-
-                                            o_swarm.behaviour_mut().rr.add_address(&o_peer_id, o_addr.clone());
-
-                                            match libp2p::swarm::Swarm::dial(&mut o_swarm, o_addr) {
-                                                Ok(_) => println!("connect: dial gestartet peer={}", s_peer_id),
-                                                Err(e) => println!("connect: dial fehlgeschlagen: {}", e),
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    break;
-                                }
+                o_ctl_opt = o_ctl_rx.recv() => {
+                    if let Some(o_ctl) = o_ctl_opt {
+                        match o_ctl {
+                            SwarmControlMsg::RegisterPeerAddr { s_peer_id, s_addr } => {
+                                let o_peer_id = match parse_peer_id(&s_peer_id) {
+                                    Ok(v) => v,
+                                    Err(e) => { println!("register: {}", e); continue; }
+                                };
+                                let o_addr = match parse_multiaddr(&s_addr) {
+                                    Ok(v) => v,
+                                    Err(e) => { println!("register: {}", e); continue; }
+                                };
+                                o_swarm.behaviour_mut().rr.add_address(&o_peer_id, o_addr);
+                                println!("register: peer={} addr gesetzt", s_peer_id);
                             }
+                            SwarmControlMsg::ConnectPeer { s_peer_id, s_addr } => {
+                                let o_peer_id = match parse_peer_id(&s_peer_id) {
+                                    Ok(v) => v,
+                                    Err(e) => { println!("connect: {}", e); continue; }
+                                };
+                                let o_addr = match parse_multiaddr(&s_addr) {
+                                    Ok(v) => v,
+                                    Err(e) => { println!("connect: {}", e); continue; }
+                                };
 
-                            o_call_opt = o_rx.recv() => {
-                                if let Some(o_call) = o_call_opt {
-                                    let i_id = o_swarm
-                                        .behaviour_mut()
-                                        .rr
-                                        .send_request(&o_call.o_peer, o_call.v_req);
+                                o_swarm.behaviour_mut().rr.add_address(&o_peer_id, o_addr.clone());
 
-                                    map_pending.insert(i_id, o_call.o_tx);
-                                } else {
-                                    break;
-                                }
-                            }
-
-                            o_evt = o_swarm.select_next_some() => {
-                                match o_evt {
-
-                                    SwarmEvent::NewListenAddr { address, .. } => {
-                                        println!("listen addr: {}", address);
-                                    }
-
-                                    SwarmEvent::ListenerError { error, .. } => {
-                                        println!("listener error: {}", error);
-                                    }
-
-                                    SwarmEvent::ListenerClosed { .. } => {
-                                        println!("listener closed");
-                                    }
-
-                                    SwarmEvent::IncomingConnection { send_back_addr, .. } => {
-                                        println!("incoming connection from: {}", send_back_addr);
-                                    }
-
-                                     SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                                        {
-                                            let mut set_peers = o_connected_peers.lock().await;
-                                            set_peers.insert(peer_id);
-                                        }
-                                        //print_connected_peers(&o_connected_peers).await;
-                                    }
-                                    SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                                        {
-                                            let mut set_peers = o_connected_peers.lock().await;
-                                            set_peers.remove(&peer_id);
-                                        }
-                                        //print_connected_peers(&o_connected_peers).await;
-                                    }
-
-                                    SwarmEvent::Behaviour(P2pBehaviourEvent::Mdns(mdns::Event::Discovered(v_list))) => {
-                                        for (o_peer, o_addr) in v_list {
-                                            o_swarm.behaviour_mut().rr.add_address(&o_peer, o_addr);
-                                        }
-                                    }
-
-                                    SwarmEvent::Behaviour(P2pBehaviourEvent::Mdns(mdns::Event::Expired(v_list))) => {
-                                        for (o_peer, o_addr) in v_list {
-                                            o_swarm.behaviour_mut().rr.remove_address(&o_peer, &o_addr);
-                                        }
-                                    }
-
-                                    SwarmEvent::Behaviour(P2pBehaviourEvent::Rr(request_response::Event::Message { peer, message, .. })) => {
-                                        match message {
-
-                                            request_response::Message::Response { request_id, response } => {
-                                                if let Some(o_tx) = map_pending.remove(&request_id) {
-                                                    let _ = o_tx.send(Ok(response));
-                                                }
-                                            }
-
-                                            request_response::Message::Request { request, channel, .. } => {
-                                                let v_resp = match (o_server_handler)(peer, request).await {
-                                                    Ok(v_ok) => v_ok,
-                                                    Err(s_err) => s_err.as_bytes().to_vec(),
-                                                };
-
-                                                let _ = o_swarm
-                                                    .behaviour_mut()
-                                                    .rr
-                                                    .send_response(channel, v_resp);
-                                            }
-                                        }
-                                    }
-
-                                    _ => {}
+                                match libp2p::swarm::Swarm::dial(&mut o_swarm, o_addr) {
+                                    Ok(_) => println!("connect: dial gestartet peer={}", s_peer_id),
+                                    Err(e) => println!("connect: dial fehlgeschlagen: {}", e),
                                 }
                             }
                         }
+                    } else {
+                        break;
+                    }
+                }
+
+                o_call_opt = o_rx.recv() => {
+                    if let Some(o_call) = o_call_opt {
+                        let i_id = o_swarm
+                            .behaviour_mut()
+                            .rr
+                            .send_request(&o_call.o_peer, o_call.v_req);
+
+                        map_pending.insert(i_id, o_call.o_tx);
+                    } else {
+                        break;
+                    }
+                }
+
+                o_evt = o_swarm.select_next_some() => {
+                    match o_evt {
+
+                        SwarmEvent::NewListenAddr { address, .. } => {
+                            println!("listen addr: {}", address);
+                        }
+
+                        SwarmEvent::ListenerError { error, .. } => {
+                            println!("listener error: {}", error);
+                        }
+
+                        SwarmEvent::ListenerClosed { .. } => {
+                            println!("listener closed");
+                        }
+
+                        SwarmEvent::IncomingConnection { send_back_addr, .. } => {
+                            println!("incoming connection from: {}", send_back_addr);
+                        }
+
+                         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                            {
+                                let mut set_peers = o_connected_peers.lock().await;
+                                set_peers.insert(peer_id);
+                            }
+                            //print_connected_peers(&o_connected_peers).await;
+                        }
+                        SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                            {
+                                let mut set_peers = o_connected_peers.lock().await;
+                                set_peers.remove(&peer_id);
+                            }
+                            //print_connected_peers(&o_connected_peers).await;
+                        }
+
+                        SwarmEvent::Behaviour(P2pBehaviourEvent::Mdns(mdns::Event::Discovered(v_list))) => {
+                            for (o_peer, o_addr) in v_list {
+                                o_swarm.behaviour_mut().rr.add_address(&o_peer, o_addr);
+                            }
+                        }
+
+                        SwarmEvent::Behaviour(P2pBehaviourEvent::Mdns(mdns::Event::Expired(v_list))) => {
+                            for (o_peer, o_addr) in v_list {
+                                o_swarm.behaviour_mut().rr.remove_address(&o_peer, &o_addr);
+                            }
+                        }
+
+                        SwarmEvent::Behaviour(P2pBehaviourEvent::Rr(request_response::Event::Message { peer, message, .. })) => {
+                            match message {
+
+                                request_response::Message::Response { request_id, response } => {
+                                    if let Some(o_tx) = map_pending.remove(&request_id) {
+                                        let _ = o_tx.send(Ok(response));
+                                    }
+                                }
+
+                                request_response::Message::Request { request, channel, .. } => {
+                                    let v_resp = match (o_server_handler)(peer, request).await {
+                                        Ok(v_ok) => v_ok,
+                                        Err(s_err) => s_err.as_bytes().to_vec(),
+                                    };
+
+                                    let _ = o_swarm
+                                        .behaviour_mut()
+                                        .rr
+                                        .send_response(channel, v_resp);
+                                }
+                            }
+                        }
+
+                        _ => {}
+                    }
+                }
+            }
         }
     });
 }
@@ -359,7 +374,15 @@ pub async fn send_request_bytes(
         .await
         .map_err(|_| "p2p send queue closed".to_string())?;
 
-    o_rx.await.map_err(|_| "p2p oneshot closed".to_string())?
+    let i_timeout_ms: u64 = std::env::var("P2P_REQ_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(1500);
+
+    match tokio::time::timeout(std::time::Duration::from_millis(i_timeout_ms), o_rx).await {
+        Ok(v) => v.map_err(|_| "p2p oneshot closed".to_string())?,
+        Err(_) => Ok(Vec::new()),
+    }
 }
 
 pub async fn get_connected_peers(o_rt: &P2pRuntime) -> Vec<PeerId> {

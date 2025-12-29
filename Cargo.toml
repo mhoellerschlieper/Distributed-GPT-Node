@@ -39,6 +39,10 @@ libp2p = { version = "0.56", default-features = false, features = [
 
 base64 = "0.22"
 
+axum = { version = "0.7.9", features = ["ws"] }
+tower-http = { version = "0.6", features = ["cors"] }
+uuid = { version = "1", features = ["v4"] }
+
 
 # 👉 Falls du später GPU nutzen willst:
 #   candle-core = { git = "...", package = "candle-core", features = ["cuda"] }

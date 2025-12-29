@@ -77,7 +77,7 @@ fn is_valid_shard_filename(s_name: &str) -> bool {
 fn load_shard_paths_from_index_json(s_index_json_path: &str) -> Result<Vec<String>, String> {
     let p_index = Path::new(s_index_json_path);
     if !p_index.exists() {
-        return Err("index json datei fehlt".to_string());
+        return Err("index json datei fehlt:".to_string() + s_index_json_path);
     }
 
     let p_dir = p_index

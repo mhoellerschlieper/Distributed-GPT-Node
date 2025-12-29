@@ -13,6 +13,18 @@
 
 use serde::{Deserialize, Serialize};
 
+
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionClearRequest {
+    pub s_session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionClearResponse {
+    pub b_ok: bool,
+    pub s_error: String,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunBlockRequest {
     pub s_model_name: String,

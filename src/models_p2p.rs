@@ -77,8 +77,10 @@ impl P2pLlamaModel {
                 .map_err(|e| format!("safetensors mmap fehlgeschlagen: {}", e))?
         };
 
-        let o_model = LocalLlama::load(o_vb, &o_config).map_err(|e| format!("llama load: {}", e))?;
-        let o_cache = Cache::new(true, e_dtype, &o_config, &o_dev).map_err(|e| format!("llama cache: {}", e))?;
+        let o_model =
+            LocalLlama::load(o_vb, &o_config).map_err(|e| format!("llama load: {}", e))?;
+        let o_cache = Cache::new(true, e_dtype, &o_config, &o_dev)
+            .map_err(|e| format!("llama cache: {}", e))?;
 
         let o_blocks_map = BlocksMap::from_file(s_blocks_map_file)?;
 
@@ -138,7 +140,7 @@ impl P2pLlamaModel {
             // borrow fix: llama ref in lokale variable
             let o_llama = self.o_model.inner_ref();
 
-            let o_logits = p2p_llama_forward::forward_p2p(
+            let o_logits_res  = p2p_llama_forward::forward_p2p(
                 o_llama,
                 &self.o_blocks_map,
                 self.o_my_peer_id,
@@ -147,12 +149,18 @@ impl P2pLlamaModel {
                 0,
                 &mut self.o_cache,
             )
-            .await
-            .map_err(|e| format!("p2p forward: {}", e))?;
+            .await;
 
-            let v_rows: Vec<Vec<f32>> = o_logits
-                .to_vec2()
-                .map_err(|e| format!("to_vec2: {}", e))?;
+            let o_logits = match o_logits_res {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = self.reset_kv_cache();
+                    return Err(format!("p2p forward fehler: {}", e));
+                }
+            };
+
+            let v_rows: Vec<Vec<f32>> =
+                o_logits.to_vec2().map_err(|e| format!("to_vec2: {}", e))?;
 
             self.i_prev_len = v_ids.len();
             return Ok(v_rows.into_iter().next().unwrap_or_default());
@@ -170,7 +178,7 @@ impl P2pLlamaModel {
 
             let o_llama = self.o_model.inner_ref();
 
-            let o_logits = p2p_llama_forward::forward_p2p(
+            let o_logits_res = p2p_llama_forward::forward_p2p(
                 o_llama,
                 &self.o_blocks_map,
                 self.o_my_peer_id,
@@ -179,12 +187,18 @@ impl P2pLlamaModel {
                 i_pos,
                 &mut self.o_cache,
             )
-            .await
-            .map_err(|e| format!("p2p forward: {}", e))?;
+            .await;
+            
+            let o_logits = match o_logits_res {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = self.reset_kv_cache();
+                    return Err(format!("p2p forward fehler: {}", e));
+                }
+            };
 
-            let v_rows: Vec<Vec<f32>> = o_logits
-                .to_vec2()
-                .map_err(|e| format!("to_vec2: {}", e))?;
+            let v_rows: Vec<Vec<f32>> =
+                o_logits.to_vec2().map_err(|e| format!("to_vec2: {}", e))?;
 
             v_out = v_rows.into_iter().next().unwrap_or_default();
             self.i_prev_len += 1;

@@ -789,7 +789,16 @@ async fn chat_loop(
                 break;
             }
 
-            let v_logits = mdl.forward_tokens(&ctx_ids).await?;
+            // alles 
+            let v_logits = match mdl.forward_tokens(&ctx_ids).await {
+                Ok(v) => v,
+                Err(s_err) => {
+                    println!();
+                    println!("[p2p fehler, ignored] {}", s_err);
+                    println!();
+                    break;
+                }
+            };
             let next_idx = pick_top1(&v_logits, env_f32("TEMP", 0.8)) as u32;
 
             ctx_ids.push(next_idx);

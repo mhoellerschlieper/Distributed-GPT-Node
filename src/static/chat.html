@@ -1,0 +1,248 @@
+<!-- static/chat.html -->
+<!-- ------------------------------------------------------------
+     Web Chat UI
+     Autor: Marcus Schlieper, ExpChat.ai
+     Historie:
+     - 2025-12-28 Marcus Schlieper: initiale chat ui
+     - 2025-12-29 Marcus Schlieper: websocket chunk streaming client
+     ------------------------------------------------------------ -->
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ExpChat Web</title>
+  <style>
+    body { margin:0; font-family: Arial, sans-serif; background:#0b1220; color:#e6e9ef; }
+    .wrap { max-width: 980px; margin: 0 auto; padding: 18px; }
+    .bar { display:flex; gap:10px; align-items:center; margin-bottom: 12px; }
+    .card { background:#121b2e; border:1px solid #223055; border-radius:14px; padding:14px; }
+    .title { font-size: 18px; font-weight: 700; }
+    .muted { color:#aab3c7; font-size: 12px; }
+    .chat { height: 62vh; overflow:auto; padding: 10px; background:#0f1729; border-radius: 12px; border:1px solid #223055; }
+    .msg { margin: 10px 0; display:flex; }
+    .msg.user { justify-content: flex-end; }
+    .bubble { max-width: 78%; padding: 10px 12px; border-radius: 12px; line-height: 1.35; white-space: pre-wrap; }
+    .user .bubble { background:#2b3b66; border:1px solid #3a4f86; }
+    .assistant .bubble { background:#132541; border:1px solid #1f3b67; }
+    .row { display:flex; gap:10px; margin-top: 12px; }
+    input[type=text] { flex:1; padding: 12px; border-radius: 12px; border:1px solid #223055; background:#0f1729; color:#e6e9ef; }
+    button { padding: 12px 14px; border-radius: 12px; border:1px solid #223055; background:#1a2c52; color:#e6e9ef; cursor:pointer; }
+    button:hover { background:#243b6c; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="bar">
+      <div class="card" style="flex:1">
+        <div class="title">ExpChat Web</div>
+        <div class="muted">LAN Chat mit Sessions, Peers und Clear</div>
+      </div>
+      <div class="card">
+        <div class="muted">Session</div>
+        <div id="session_id" class="title"></div>
+      </div>
+      <div class="card">
+        <div class="muted">WebSocket</div>
+        <div id="ws_state" class="title">off</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div id="chat" class="chat"></div>
+      <div class="row">
+        <input id="txt" type="text" placeholder="Schreibe eine Frage..." />
+        <button id="send">Senden</button>
+        <button id="clear">Clear</button>
+      </div>
+      <div class="muted" id="status" style="margin-top:8px"></div>
+    </div>
+  </div>
+
+<script>
+  function new_session() {
+    const s = "sess_" + Math.random().toString(16).slice(2) + "_" + Date.now();
+    localStorage.setItem("session_id", s);
+    return s;
+  }
+
+  function get_session() {
+    return localStorage.getItem("session_id") || new_session();
+  }
+
+  function ws_url_for_path(s_path) {
+    const s_proto = (location.protocol === "https:") ? "wss:" : "ws:";
+    return s_proto + "//" + location.host + s_path;
+  }
+
+  const s_session_id = get_session();
+  document.getElementById("session_id").textContent = s_session_id;
+
+  const o_chat = document.getElementById("chat");
+  const o_status = document.getElementById("status");
+  const o_ws_state = document.getElementById("ws_state");
+
+  let o_ws = null;
+  let o_assistant_bubble = null;
+  let b_is_streaming = false;
+
+  function add_msg(s_role, s_text) {
+    const o_div = document.createElement("div");
+    o_div.className = "msg " + s_role;
+
+    const o_b = document.createElement("div");
+    o_b.className = "bubble";
+    o_b.textContent = s_text;
+
+    o_div.appendChild(o_b);
+    o_chat.appendChild(o_div);
+    o_chat.scrollTop = o_chat.scrollHeight;
+
+    return o_b;
+  }
+
+  function set_ws_state(s_text) {
+    o_ws_state.textContent = s_text;
+  }
+
+  function connect_ws_if_needed() {
+    if (o_ws && (o_ws.readyState === WebSocket.OPEN || o_ws.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+
+    const s_url = ws_url_for_path("/api/chat/ws");
+    set_ws_state("connecting");
+    o_ws = new WebSocket(s_url);
+
+    o_ws.onopen = function() {
+      set_ws_state("on");
+    };
+
+    o_ws.onclose = function() {
+      set_ws_state("off");
+      b_is_streaming = false;
+    };
+
+    o_ws.onerror = function() {
+      set_ws_state("error");
+      b_is_streaming = false;
+    };
+
+    o_ws.onmessage = function(o_evt) {
+      let o_msg = null;
+      try {
+        o_msg = JSON.parse(o_evt.data);
+      } catch (e) {
+        o_status.textContent = "ws: ungueltige server nachricht";
+        return;
+      }
+
+      if (!o_msg || !o_msg.s_type) {
+        o_status.textContent = "ws: leere server nachricht";
+        return;
+      }
+
+      if (o_msg.s_type === "start") {
+        b_is_streaming = true;
+        o_status.textContent = "Denke...";
+        o_assistant_bubble = add_msg("assistant", "");
+        return;
+      }
+
+      if (o_msg.s_type === "chunk") {
+        if (!o_assistant_bubble) {
+          o_assistant_bubble = add_msg("assistant", "");
+        }
+        o_assistant_bubble.textContent = (o_assistant_bubble.textContent || "") + (o_msg.s_text || "");
+        o_chat.scrollTop = o_chat.scrollHeight;
+        return;
+      }
+
+      if (o_msg.s_type === "done") {
+        b_is_streaming = false;
+        o_status.textContent = "";
+        return;
+      }
+
+      if (o_msg.s_type === "error") {
+        b_is_streaming = false;
+        o_status.textContent = "Fehler: " + (o_msg.s_text || "unbekannt");
+        if (!o_assistant_bubble) {
+          add_msg("assistant", "error: " + (o_msg.s_text || "unbekannt"));
+        }
+        return;
+      }
+    };
+  }
+
+  function ws_send_chat(s_text) {
+    connect_ws_if_needed();
+
+    if (!o_ws || o_ws.readyState !== WebSocket.OPEN) {
+      o_status.textContent = "ws: nicht verbunden";
+      return;
+    }
+
+    const o_payload = {
+      s_type: "send",
+      s_session_id: s_session_id,
+      s_text: s_text
+    };
+
+    try {
+      o_ws.send(JSON.stringify(o_payload));
+    } catch (e) {
+      o_status.textContent = "ws: senden fehlgeschlagen";
+    }
+  }
+
+  async function send() {
+    const o_txt = document.getElementById("txt");
+    const s_text = (o_txt.value || "").trim();
+    if (!s_text) return;
+
+    if (b_is_streaming) {
+      o_status.textContent = "Bitte warten, antwort laeuft noch";
+      return;
+    }
+
+    o_txt.value = "";
+    add_msg("user", s_text);
+    o_assistant_bubble = null;
+
+    ws_send_chat(s_text);
+  }
+
+  async function clear_session() {
+    if (b_is_streaming) {
+      o_status.textContent = "Bitte warten, antwort laeuft noch";
+      return;
+    }
+
+    o_status.textContent = "Session wird geloescht...";
+    try {
+      await fetch("/api/session/clear", {
+        method: "POST",
+        headers: {"content-type":"application/json"},
+        body: JSON.stringify({ s_session_id: s_session_id })
+      });
+    } catch (e) {
+      o_status.textContent = "clear fehlgeschlagen";
+      return;
+    }
+
+    o_chat.innerHTML = "";
+    o_status.textContent = "Fertig";
+    setTimeout(() => o_status.textContent = "", 800);
+  }
+
+  document.getElementById("send").addEventListener("click", send);
+  document.getElementById("clear").addEventListener("click", clear_session);
+  document.getElementById("txt").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") send();
+  });
+
+  connect_ws_if_needed();
+</script>
+</body>
+</html>

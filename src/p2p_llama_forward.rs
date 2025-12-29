@@ -14,10 +14,17 @@
 
 use candle::{Result, Tensor};
 use libp2p::PeerId;
+use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 use crate::local_llama::{Cache, Llama};
 use crate::p2p_blocks_map::BlocksMap;
 use crate::p2p_client_libp2p::send_block_run_and_wait;
+
+
+fn session_id_from_env() -> String {
+    std::env::var("SESSION_ID").unwrap_or_else(|_| "default_session".to_string())
+}
 
 fn push_segment(v_segments: &mut Vec<(PeerId, Vec<usize>)>, o_peer: PeerId, i_block_no: usize) {
     if let Some((o_last_peer, v_last_blocks)) = v_segments.last_mut() {
@@ -80,12 +87,16 @@ pub async fn forward_p2p(
     o_cache: &mut Cache,
 ) -> Result<Tensor> {
     let (_bs, i_seq_len) = o_ids.dims2()?;
-    let s_session_id =
-        std::env::var("SESSION_ID").unwrap_or_else(|_| "default_session".to_string());
-    // kein zugriff auf wte direkt
+    // Neu: stabile session id
+    let s_session_id = session_id_from_env();
+
+    let now = Instant::now();
+
+    // Embedding Tokens
     let mut o_x = o_llama.embed_tokens(o_ids)?;
 
-    for i_block_no in 0..o_llama.blocks_len() {
+    let mut i_block_no: usize =0;
+    while i_block_no < o_llama.blocks_len() {
         let s_peer_id = o_blocks_map
             .get_peer_for_block(s_model_name, i_block_no)
             .ok_or_else(|| candle::Error::Msg("blocks_map peer id fehlt".to_string()))?;
@@ -95,8 +106,10 @@ pub async fn forward_p2p(
             .map_err(|_| candle::Error::Msg("blocks_map peer id ungueltig".to_string()))?;
 
         if o_peer_id == o_my_peer_id {
+            // println!("Local: {}",i_block_no );
             o_x = o_llama.forward_one_block(&o_x, i_pos, i_block_no, o_cache)?;
         } else {
+            //println!("Send: {}",i_block_no );
             o_x = crate::p2p_client_libp2p::send_block_run_and_wait(
                 o_peer_id,
                 s_model_name,
@@ -107,7 +120,14 @@ pub async fn forward_p2p(
             )
             .await?;
         }
+
+        i_block_no+=1;
     }
 
-    o_llama.forward_final_from_hidden(&o_x, i_seq_len)
+    // Hidden
+    let res = o_llama.forward_final_from_hidden(&o_x, i_seq_len);
+
+    // println!("Duration for one Token: {}", now.elapsed().as_micros());
+
+    res
 }
