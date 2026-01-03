@@ -8,12 +8,14 @@
 // - Antwort kommt per oneshot
 // - eingehende Requests werden verarbeitet (server handler)
 // - liste der verbundenen peers wird verwaltet und ausgegeben
+// - neu: control message fuer clear cache broadcast sowie handler callback
 //
 // Autor: Marcus Schlieper, ExpChat.ai
-// Historie
+// Historie:
 // - 2025-12-26 Marcus Schlieper: initiale version
 // - 2025-12-26 Marcus Schlieper: swarm task architektur mit mpsc
 // - 2025-12-28 Marcus Schlieper: server handling plus peers list
+// - 2026-01-03 Marcus Schlieper: clear cache broadcast und receive handler callback
 // ------------------------------------------------------------
 
 use crate::p2p_codec::BlockProto;
@@ -47,8 +49,17 @@ pub type ServerHandler = Arc<
         + Sync,
 >;
 
-const REQUEST_TIMEOUT_SEC: u64 = 10;
+// New: clear cache handler callback for inbound clear cache messages.
+// This callback is invoked with the far peer id that requested the cache clear.
+pub type ClearCacheHandler = Arc<
+    dyn Fn(
+            PeerId,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+        + Send
+        + Sync,
+>;
 
+const REQUEST_TIMEOUT_SEC: u64 = 10;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PeerStat {
@@ -57,12 +68,23 @@ pub struct PeerStat {
     pub i_bytes_out: u64,
     pub i_bytes_in: u64,
 }
+
 // ---------------- Behaviour ----------------
 
 #[derive(Debug)]
 pub enum SwarmControlMsg {
     RegisterPeerAddr { s_peer_id: String, s_addr: String },
     ConnectPeer { s_peer_id: String, s_addr: String },
+
+    // New: broadcast clear cache from this node to all currently connected peers.
+    // Payload carries the sender peer id as ascii for validation and logging.
+    BroadcastClearCache { s_from_peer_id: String },
+}
+
+// Internal wire message for clear cache. Uses bincode via serde.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClearCacheMsg {
+    s_from_peer_id: String,
 }
 
 fn parse_peer_id(s_peer_id: &str) -> Result<PeerId, String> {
@@ -77,6 +99,39 @@ fn parse_multiaddr(s_addr: &str) -> Result<Multiaddr, String> {
         .trim()
         .parse::<Multiaddr>()
         .map_err(|_| "multiaddr ungueltig".to_string())
+}
+
+fn is_clear_cache_request(v_req: &[u8]) -> bool {
+    // Sicher: robustes probing, keine panics
+    // Strategie: versuche bincode decode, falls ok und peer id parsebar, gilt als clear cache.
+    match bincode::deserialize::<ClearCacheMsg>(v_req) {
+        Ok(o_msg) => parse_peer_id(&o_msg.s_from_peer_id).is_ok(),
+        Err(_) => false,
+    }
+}
+
+fn decode_clear_cache_request(v_req: &[u8]) -> Result<PeerId, String> {
+    let o_msg: ClearCacheMsg = bincode::deserialize(v_req)
+        .map_err(|_| "clear cache: request decode fehlgeschlagen".to_string())?;
+
+    let o_from = parse_peer_id(&o_msg.s_from_peer_id)
+        .map_err(|_| "clear cache: from peer id ungueltig".to_string())?;
+
+    Ok(o_from)
+}
+
+fn encode_clear_cache_request(o_from_peer: &PeerId) -> Result<Vec<u8>, String> {
+    let o_msg = ClearCacheMsg {
+        s_from_peer_id: o_from_peer.to_string(),
+    };
+
+    bincode::serialize(&o_msg)
+        .map_err(|_| "clear cache: request encode fehlgeschlagen".to_string())
+}
+
+fn encode_clear_cache_response_ok() -> Vec<u8> {
+    // Sicher: klein, eindeutig, ascii
+    b"ok".to_vec()
 }
 
 #[derive(NetworkBehaviour)]
@@ -95,6 +150,7 @@ pub struct OutboundCall {
     pub v_req: Vec<u8>,
     pub o_tx: oneshot::Sender<Result<Vec<u8>, String>>,
 }
+
 #[derive(Clone)]
 pub struct P2pRuntime {
     pub o_tx: mpsc::Sender<OutboundCall>,
@@ -170,7 +226,7 @@ pub fn build_runtime(
 
     let (o_tx, o_rx) = mpsc::channel::<OutboundCall>(64);
 
-    // neu: control channel
+    // control channel
     let (o_ctl_tx, o_ctl_rx) = mpsc::channel::<SwarmControlMsg>(16);
 
     let o_connected_peers: Arc<Mutex<HashSet<PeerId>>> = Arc::new(Mutex::new(HashSet::new()));
@@ -206,21 +262,35 @@ pub fn add_peer_address(
     o_swarm.behaviour_mut().rr.add_address(&o_peer, o_addr);
 
     {
-        // connected peers ist nur status, nicht zwingend sofort verbunden
-        // aber du siehst: adresse ist gesetzt
-
         println!("add_peer_address");
     }
 
     Ok(())
 }
 
+// New: broadcast API entry point.
+// Sends SwarmControlMsg::BroadcastClearCache which triggers send_request to all connected peers.
+pub async fn send_clear_cache_to_all(o_rt: &P2pRuntime) -> Result<(), String> {
+    let o_msg = SwarmControlMsg::BroadcastClearCache {
+        s_from_peer_id: o_rt.o_self_peer_id.to_string(),
+    };
+
+    o_rt.o_ctl_tx
+        .send(o_msg)
+        .await
+        .map_err(|_| "send_clear_cache_to_all: control channel closed".to_string())?;
+
+    Ok(())
+}
+
+// Updated: takes clear cache handler.
 pub fn spawn_swarm_task(
     mut o_swarm: SwarmType,
     mut o_rx: mpsc::Receiver<OutboundCall>,
     mut o_ctl_rx: mpsc::Receiver<SwarmControlMsg>,
     o_server_handler: ServerHandler,
     o_connected_peers: Arc<Mutex<HashSet<PeerId>>>,
+    o_clear_cache_handler: ClearCacheHandler,
 ) {
     tokio::spawn(async move {
         let mut map_pending: HashMap<RequestIdType, oneshot::Sender<Result<Vec<u8>, String>>> =
@@ -260,6 +330,40 @@ pub fn spawn_swarm_task(
                                     Err(e) => println!("connect: dial fehlgeschlagen: {}", e),
                                 }
                             }
+                            SwarmControlMsg::BroadcastClearCache { s_from_peer_id } => {
+                                // Historie:
+                                // - 2026-01-03 Marcus Schlieper: broadcast clear cache an alle verbundenen peers
+
+                                println!("broadcast clear cache: {}", s_from_peer_id);
+                                let o_from = match parse_peer_id(&s_from_peer_id) {
+                                    Ok(v) => v,
+                                    Err(_) => { println!("clear cache: self peer id ungueltig"); continue; }
+                                };
+
+                                let v_peers: Vec<PeerId> = {
+                                    let set_peers = o_connected_peers.lock().await;
+                                    set_peers.iter().cloned().collect()
+                                };
+
+                                if v_peers.is_empty() {
+                                    println!("clear cache: keine peers verbunden");
+                                    continue;
+                                }
+
+                                let v_req = match encode_clear_cache_request(&o_from) {
+                                    Ok(v) => v,
+                                    Err(e) => { println!("clear cache: {}", e); continue; }
+                                };
+
+                                println!("clear cache: broadcast an {} peers", v_peers.len());
+                                for o_peer in v_peers {
+                                    // Keine oneshot sender, fire and forget.
+                                    // Verwendung von rr send_request ohne pending tracking, weil response nicht benoetigt.
+                                    let _ = o_swarm.behaviour_mut().rr.send_request(&o_peer, v_req.clone());
+                                }
+
+                                
+                            }
                         }
                     } else {
                         break;
@@ -296,21 +400,35 @@ pub fn spawn_swarm_task(
 
                         SwarmEvent::IncomingConnection { send_back_addr, .. } => {
                             println!("incoming connection from: {}", send_back_addr);
+
                         }
 
-                         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                             {
                                 let mut set_peers = o_connected_peers.lock().await;
                                 set_peers.insert(peer_id);
                             }
-                            //print_connected_peers(&o_connected_peers).await;
+
+                             println!("peer established: {}", peer_id);
+
+                            // Abschnitt: Server Cache fuer neu verbundenen Peer deterministisch resetten
+                            // Hinweis: Hier wird bewusst der ClearCacheHandler wiederverwendet, da dieser
+                            // die korrekte serverseitige Reset Logik kapselt und keine zusaetzlichen
+                            // Abhaengigkeiten (StateRef) in p2p_node.rs eingefuehrt werden muessen.
+                            match (o_clear_cache_handler)(peer_id).await {
+                                Ok(()) => {
+                                    println!("connection established: cache reset ok peer={}", peer_id);
+                                }
+                                Err(e) => {
+                                    println!("connection established: cache reset failed peer={} err={}", peer_id, e);
+                                }
+                            }
                         }
                         SwarmEvent::ConnectionClosed { peer_id, .. } => {
                             {
                                 let mut set_peers = o_connected_peers.lock().await;
                                 set_peers.remove(&peer_id);
                             }
-                            //print_connected_peers(&o_connected_peers).await;
                         }
 
                         SwarmEvent::Behaviour(P2pBehaviourEvent::Mdns(mdns::Event::Discovered(v_list))) => {
@@ -335,6 +453,33 @@ pub fn spawn_swarm_task(
                                 }
 
                                 request_response::Message::Request { request, channel, .. } => {
+                                    // New: multiplex incoming message types.
+                                    // If this is a clear cache request, run clear handler and reply ok.
+                                    if is_clear_cache_request(&request) {
+                                        let o_from_peer = match decode_clear_cache_request(&request) {
+                                            Ok(v) => v,
+                                            Err(e) => {
+                                                let _ = o_swarm.behaviour_mut().rr.send_response(channel, e.as_bytes().to_vec());
+                                                continue;
+                                            }
+                                        };
+
+                                        println!("receive clear cache: {}", o_from_peer);
+                                        // receive_clear_cache: reset cache only for far peer id
+                                        // Fehler werden als ascii in response kodiert.
+                                        match (o_clear_cache_handler)(o_from_peer).await {
+                                            Ok(()) => {
+                                                let _ = o_swarm.behaviour_mut().rr.send_response(channel, encode_clear_cache_response_ok());
+                                            }
+                                            Err(e) => {
+                                                let _ = o_swarm.behaviour_mut().rr.send_response(channel, e.as_bytes().to_vec());
+                                            }
+                                        }
+
+                                        continue;
+                                    }
+
+                                    // Default: forward to existing server handler.
                                     let v_resp = match (o_server_handler)(peer, request).await {
                                         Ok(v_ok) => v_ok,
                                         Err(s_err) => s_err.as_bytes().to_vec(),

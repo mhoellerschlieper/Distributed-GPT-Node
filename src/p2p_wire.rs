@@ -40,8 +40,6 @@ pub struct RunBlockResponse {
     pub s_error: String,
 }
 
-
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunBlocksResponse {
     pub o_y: WireTensor,
