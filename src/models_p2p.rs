@@ -59,7 +59,7 @@ impl P2pLlamaModel {
     ) -> Result<Self, String> {
         let o_dev = Device::Cpu;
 
-        print_model_report_candle(s_weights_path, s_config_json)?;
+        //print_model_report_candle(s_weights_path, s_config_json)?;
 
         let v_cfg_bytes = std::fs::read(s_config_json)
             .map_err(|e| format!("config json lesen fehlgeschlagen: {}", e))?;

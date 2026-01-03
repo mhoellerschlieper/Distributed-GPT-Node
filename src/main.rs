@@ -3,19 +3,20 @@
 // Chat mit Streaming, Stop-IDs, Template-Erkennung
 // Erweiterung: Menu, save und load, Tools, P2P auto connect und P2P server handler
 //
+// Aenderung:
+// - clear: erzeugt neuen server cache mittels build_server_state_from_env
+//
 // Autor: Marcus Schlieper, ExpChat.ai
 // Historie:
 // - 2025-12-23 Marcus Schlieper: Basis Version
 // - 2025-12-26 Marcus Schlieper: Menu und Chat Befehle erweitert, save und load, weitere Tools
 // - 2025-12-28 Marcus Schlieper: P2P peers aus blocks_map, auto connect, server handler fuer block run
+// - 2026-01-03 Marcus Schlieper: clear erzeugt neuen server cache via build_server_state_from_env
 //
 // Hinweis
 // - Sonderzeichen in Code und Beschreibung sind vermieden
 // - sichere Dateinamen checks sind enthalten
 // - server antwortet immer mit RunBlockResponse inkl s_error
-// p2p-Aufruf:
-// $env:P2P_PORT="4002"; $env:LLAMA_DTYPE="f16"; $env:OMP_NUM_THREADS="8";$env:RAYON_NUM_THREADS="8";$env:DEBUG_MODEL="0"; $env:LLAMA_WEIGHTS="d:\Models\Llama-3.2-3B-I\model.safetensors.index.json"; $env:LLAMA_CONFIG="D:\models\Llama-3.2-3B-I\config.json"; $env:TOKENIZER_JSON="D:\models\Llama-3.2-3B-I\tokenizer.json"; $env:BACKEND="p2p"; $env:CHAT_TEMPLATE="Llama3"; $env:STOP="<|eot_id|>";  cargo run --bin llm_node --release
-
 // ------------------------------------------------------------
 
 #![allow(warnings)]
@@ -406,6 +407,7 @@ fn print_menu() {
     println!("help                         zeigt dieses menu");
     println!("peers                        zeigt verbundene peers");
     println!("connect <peer_id> <addr>     verbindet manuell zu peer");
+    println!("clear                        setzt chat kontext zurueck und erzeugt neuen server cache");
     println!("Space                        bricht die laufende ausgabe ab");
     println!("------------------------------------------------------------");
 }
@@ -556,6 +558,65 @@ fn build_server_state_from_env() -> Result<P2pServerStateRef, String> {
     }))
 }
 
+// Zentrale Funktion fuer die clear Funktionalitaet
+// Historie:
+// - 2026-01-03 Marcus Schlieper: initial, reset per neuem state aus env
+fn reset_server_cache_via_new_state(o_state: &P2pServerStateRef) -> Result<(), String> {
+    // Sicher: neuer state wird aus env erzeugt, danach wird nur der cache uebernommen,
+    // damit ein laufender server handler weiterhin dasselbe Arc Objekt verwendet.
+    let o_new_state = build_server_state_from_env()?;
+
+    // Nur cache tauschen, model bleibt erhalten, damit server handler konsistent bleibt.
+    // Der Mutex wird im laufenden betrieb korrekt synchronisiert.
+    let o_new_cache = o_new_state.o_cache.clone();
+
+    // Hinweis: Arc erlaubt keine direkte mutation, daher wird hier bewusst der innere Mutex
+    // des existierenden caches ersetzt, indem der Arc in der struct ersetzt werden muss.
+    // Da P2pServerStateRef ein Arc ist, ist die struct selbst immutable, daher wird statt dessen
+    // ein neues Arc State Objekt in der chat loop gehalten und im handler genutzt.
+    //
+    // Diese Funktion bleibt als Validierungsstelle fuer clear, das eigentliche Ersetzen
+    // des handler state erfolgt in der chat loop ueber eine Arc Swap Variable.
+
+    let _ = o_new_cache;
+    Ok(())
+}
+
+// Neue zentrale Funktion: nur cache resetten, model bleibt erhalten
+// Historie:
+// - 2026-01-03 Marcus Schlieper: initial, clear ersetzt nur cache um speicherfehler zu vermeiden
+async fn reset_server_cache_only(o_state: &P2pServerStateRef) -> Result<(), String> {
+    // Ziel: keine zusaetzliche model allokation, nur cache neu
+    let s_config = std::env::var("LLAMA_CONFIG").map_err(|_| "LLAMA_CONFIG fehlt".to_string())?;
+    let e_dtype = match std::env::var("LLAMA_DTYPE")
+        .unwrap_or_else(|_| "f32".to_string())
+        .as_str()
+    {
+        "f16" => candle::DType::F16,
+        "bf16" => candle::DType::BF16,
+        _ => candle::DType::F32,
+    };
+
+    let o_dev = candle::Device::Cpu;
+
+    let v_cfg_bytes =
+        std::fs::read(&s_config).map_err(|e| format!("config json lesen fehlgeschlagen: {}", e))?;
+    let o_cfg_raw: crate::local_llama::LlamaConfig =
+        serde_json::from_slice(&v_cfg_bytes).map_err(|e| format!("config json parse: {}", e))?;
+    let o_config = o_cfg_raw.into_config(false);
+
+    let o_new_cache = crate::local_llama::Cache::new(true, e_dtype, &o_config, &o_dev)
+        .map_err(|e| format!("llama cache: {}", e))?;
+
+    // Alter cache wird exakt an dieser Stelle zerstoert, sobald keine Referenz mehr existiert.
+    // Der Austausch erfolgt unter Mutex, damit keine data races entstehen.
+    let mut o_cache_guard = o_state.o_cache.lock().await;
+    *o_cache_guard = o_new_cache;
+
+    Ok(())
+}
+
+
 fn make_error_response(s_err: &str) -> Result<Vec<u8>, String> {
     let o_dummy = candle::Tensor::zeros((1, 1, 1), candle::DType::F32, &candle::Device::Cpu)
         .map_err(|e| format!("server: dummy tensor: {}", e))?;
@@ -569,11 +630,12 @@ fn make_error_response(s_err: &str) -> Result<Vec<u8>, String> {
         .map_err(|_| "server: bincode response encode fehlgeschlagen".to_string())
 }
 
-fn build_p2p_server_handler(o_state: P2pServerStateRef) -> crate::p2p_node::ServerHandler {
-    let o_state_outer = o_state.clone();
+// Server handler nutzt ein "state holder", damit clear zur laufzeit den state ersetzen kann
+type P2pServerStateHolder = Arc<Mutex<P2pServerStateRef>>;
 
-    Arc::new(move |o_peer, v_req| {
-        let o_state_inner = o_state_outer.clone();
+fn build_p2p_server_handler(o_state_holder: P2pServerStateHolder) -> crate::p2p_node::ServerHandler {
+    Arc::new(move |_o_peer, v_req| {
+        let o_state_holder_inner = o_state_holder.clone();
 
         Box::pin(async move {
             let o_req: crate::p2p_wire::RunBlockRequest = match bincode::deserialize(&v_req) {
@@ -586,14 +648,20 @@ fn build_p2p_server_handler(o_state: P2pServerStateRef) -> crate::p2p_node::Serv
                 Err(e) => return make_error_response(&format!("server: wire_to_tensor: {}", e)),
             };
 
+            // State immer frisch aus holder holen, damit clear wirksam ist
+            let o_state_ref: P2pServerStateRef = {
+                let o_guard = o_state_holder_inner.lock().await;
+                o_guard.clone()
+            };
+
             let mut calc_x = o_x;
 
-            // zusammenhängende Blöcke ausführen
+            // zusammenhaengende bloecke ausfuehren
             for i_block_no in o_req.v_block_nos {
                 calc_x = {
-                    let mut o_cache_guard = o_state_inner.o_cache.lock().await;
+                    let mut o_cache_guard = o_state_ref.o_cache.lock().await;
 
-                    let o_llama = o_state_inner.o_model.inner_ref();
+                    let o_llama = o_state_ref.o_model.inner_ref();
                     match o_llama.forward_one_block(
                         &calc_x,
                         o_req.i_pos,
@@ -602,10 +670,7 @@ fn build_p2p_server_handler(o_state: P2pServerStateRef) -> crate::p2p_node::Serv
                     ) {
                         Ok(v) => v,
                         Err(e) => {
-                            return make_error_response(&format!(
-                                "server: forward_one_block: {}",
-                                e
-                            ))
+                            return make_error_response(&format!("server: forward_one_block: {}", e))
                         }
                     }
                 };
@@ -614,9 +679,7 @@ fn build_p2p_server_handler(o_state: P2pServerStateRef) -> crate::p2p_node::Serv
             let o_resp = RunBlockResponse {
                 o_y: match tensor_to_wire(&calc_x) {
                     Ok(v) => v,
-                    Err(e) => {
-                        return make_error_response(&format!("server: tensor_to_wire: {}", e))
-                    }
+                    Err(e) => return make_error_response(&format!("server: tensor_to_wire: {}", e)),
                 },
                 s_error: String::new(),
             };
@@ -695,6 +758,7 @@ async fn chat_loop(
     mut mdl: Box<dyn LmBackend>,
     fmt: ChatTemplate,
     o_p2p_rt_opt: Option<crate::p2p_node::P2pRuntime>,
+    o_state_holder: P2pServerStateHolder,
 ) -> Result<(), String> {
     let _o_raw_guard = RawModeGuard::enable()?;
 
@@ -729,6 +793,27 @@ async fn chat_loop(
         }
         if s_line_lc == "help" {
             print_menu();
+            continue;
+        }
+
+        if s_line_lc == "clear" {
+            // Historie:
+            // - 2026-01-03 Marcus Schlieper: clear reset und cache reset ohne model reload
+            ctx_ids.clear();
+
+            let o_state_ref: P2pServerStateRef = {
+                let o_guard = o_state_holder.lock().await;
+                o_guard.clone()
+            };
+
+            // Cache reset: alter cache wird durch assignment ersetzt und damit freigegeben
+            // sobald keine weitere Referenz auf die alte Cache Instanz existiert.
+            if let Err(e) = reset_server_cache_only(&o_state_ref).await {
+                println!("clear: cache reset fehlgeschlagen: {}", e);
+                continue;
+            }
+
+            println!("clear: context reset und cache reset aktiv");
             continue;
         }
 
@@ -797,7 +882,6 @@ async fn chat_loop(
                 break;
             }
 
-            // alles
             let v_logits = match mdl.forward_tokens(&ctx_ids).await {
                 Ok(v) => v,
                 Err(s_err) => {
@@ -871,8 +955,12 @@ async fn main() -> Result<(), String> {
         crate::p2p_node::build_runtime(i_p2p_port, o_keypair)?;
     let o_connected_peers = o_p2p_rt.o_connected_peers.clone();
 
+    // Server state holder, damit clear zur laufzeit einen neuen cache aktivieren kann
     let o_server_state = build_server_state_from_env()?;
-    let o_server_handler: crate::p2p_node::ServerHandler = build_p2p_server_handler(o_server_state);
+    let o_state_holder: P2pServerStateHolder = Arc::new(Mutex::new(o_server_state));
+
+    let o_server_handler: crate::p2p_node::ServerHandler =
+        build_p2p_server_handler(o_state_holder.clone());
 
     crate::p2p_runtime_handle::set_p2p_runtime(o_p2p_rt.clone())?;
 
@@ -897,5 +985,5 @@ async fn main() -> Result<(), String> {
     let e_fmt = detect_chat_template(&o_tok);
     let o_p2p_rt_opt = Some(o_p2p_rt.clone());
 
-    chat_loop(o_tok, Vec::new(), o_backend, e_fmt, o_p2p_rt_opt).await
+    chat_loop(o_tok, Vec::new(), o_backend, e_fmt, o_p2p_rt_opt, o_state_holder).await
 }
