@@ -77,12 +77,15 @@ impl P2pLlamaModel {
                 .map_err(|e| format!("safetensors mmap fehlgeschlagen: {}", e))?
         };
 
+        let o_blocks_map = BlocksMap::from_file(s_blocks_map_file)?;
+
         let o_model =
-            LocalLlama::load(o_vb, &o_config).map_err(|e| format!("llama load: {}", e))?;
+            LocalLlama::load(o_vb, &o_config, &o_blocks_map).map_err(|e| format!("llama load: {}", e))?;
+
         let o_cache = Cache::new(true, e_dtype, &o_config, &o_dev)
             .map_err(|e| format!("llama cache: {}", e))?;
 
-        let o_blocks_map = BlocksMap::from_file(s_blocks_map_file)?;
+        
 
         if debug_on() {
             println!(

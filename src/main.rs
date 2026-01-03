@@ -808,7 +808,7 @@ fn build_peer_hash_from_peer_id(o_peer: &PeerId) -> u64 {
 /// - Optional ENV: LLAMA_DTYPE
 /// - Output: shared P2pServerStateRef with empty per-peer cache map
 /// - Important: loads model once and shares it across requests
-fn build_server_state_from_env() -> Result<P2pServerStateRef, String> {
+fn build_server_state_from_env(o_blocks_map: &crate::p2p_blocks_map::BlocksMap) -> Result<P2pServerStateRef, String> {
     // Section: read mandatory config paths
     let s_weights =
         std::env::var("LLAMA_WEIGHTS").map_err(|_| "LLAMA_WEIGHTS fehlt".to_string())?;
@@ -844,7 +844,7 @@ fn build_server_state_from_env() -> Result<P2pServerStateRef, String> {
     };
 
     // Section: load model weights and initialize LocalLlama
-    let o_model = crate::local_llama::LocalLlama::load(o_vb, &o_config)
+    let o_model = crate::local_llama::LocalLlama::load(o_vb, &o_config, o_blocks_map)
         .map_err(|e| format!("llama load: {}", e))?;
 
     Ok(Arc::new(P2pServerState {
@@ -1073,7 +1073,7 @@ fn build_clear_cache_handler(
             };
 
             // Important: operator log for debugging and audits
-            println!("build_clear_cache_handler - far peer-ID: {}", o_far_peer_id);
+            println!("build_clear_cache_handler for far peer-ID: {}", o_far_peer_id);
 
             // Section: reset per-peer cache only
             reset_server_cache_only(&o_state_ref, &o_far_peer_id).await
@@ -1523,7 +1523,7 @@ async fn main() -> Result<(), String> {
     let o_connected_peers = o_p2p_rt.o_connected_peers.clone();
 
     // Section: server state holder (indirection supports runtime clear behavior)
-    let o_server_state = build_server_state_from_env()?;
+    let o_server_state = build_server_state_from_env(&o_blocks_map)?;
     let o_state_holder: P2pServerStateHolder = Arc::new(Mutex::new(o_server_state));
 
     // Section: build server handler and clear-cache handler
@@ -1570,8 +1570,6 @@ async fn main() -> Result<(), String> {
     let o_p2p_rt_opt = Some(o_p2p_rt.clone());
 
     let mut ctx_ids: Vec<u32> = Vec::new();
-
-    // clear_all_caches(&mut ctx_ids, o_p2p_rt_opt.clone(), o_state_holder.clone()).await;
 
     chat_loop(
         o_tok,

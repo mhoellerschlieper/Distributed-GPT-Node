@@ -23,9 +23,11 @@
 
 use candle_transformers::models::with_tracing::{linear_no_bias as linear, Linear, RmsNorm};
 
+use crate::p2p_blocks_map::BlocksMap;
 use candle::{DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{embedding, Embedding, Module, VarBuilder};
 use candle_transformers::utils;
+use libp2p::PeerId;
 use std::collections::HashMap;
 
 pub const DEFAULT_MAX_SEQ_LEN: usize = 4096;
@@ -39,8 +41,8 @@ pub struct LocalLlama {
 }
 
 impl LocalLlama {
-    pub fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
-        let inner = Llama::load(vb, cfg)?;
+    pub fn load(vb: VarBuilder, cfg: &Config, o_blocks_map: &BlocksMap) -> Result<Self> {
+        let inner = Llama::load(vb, cfg, o_blocks_map)?;
         Ok(Self {
             inner,
             vocab_size: cfg.vocab_size,
@@ -441,7 +443,7 @@ impl Block {
 pub struct Llama {
     // keep private, expose via methods
     wte: Embedding,
-    blocks: Vec<Block>,
+    blocks: Vec<Option<Block>>,
     ln_f: RmsNorm,
     lm_head: Linear,
 }
@@ -459,6 +461,15 @@ impl Llama {
         self.blocks.len()
     }
 
+    // -----------------------------------------------------------
+    // Description
+    // Executes exactly one transformer block locally.
+    // If the block is not loaded on this peer (None), an error is returned so that
+    // the caller can route execution to the responsible peer.
+    //
+    // History
+    // - 2026-01-03 Marcus Schlieper: error if block not loaded on this peer
+    // -----------------------------------------------------------
     pub fn forward_one_block(
         &self,
         o_x: &Tensor,
@@ -466,12 +477,24 @@ impl Llama {
         i_block_no: usize,
         o_cache: &mut Cache,
     ) -> Result<Tensor> {
-        let o_b = self
+        let o_b_opt = self
             .blocks
             .get(i_block_no)
-            .ok_or_else(|| candle::Error::Msg("block not found".to_string()))?;
+            .ok_or_else(|| candle::Error::Msg("block index out of range".to_string()))?;
+
+        let o_b = o_b_opt
+            .as_ref()
+            .ok_or_else(|| candle::Error::Msg("block not loaded on this peer".to_string()))?;
+
         o_b.forward(o_x, i_pos, i_block_no, o_cache)
     }
+
+    // -----------------------------------------------------------
+    // Description
+    // Full forward across all blocks locally.
+    // This requires that every block is loaded; otherwise it returns an error.
+    // In selective loading mode, distributed execution must be used instead.
+    // -----------------------------------------------------------
 
     pub fn forward_input_embed(
         &self,
@@ -479,20 +502,48 @@ impl Llama {
         pos: usize,
         cache: &mut Cache,
     ) -> Result<Tensor> {
+        // Section: validate input tensor shape
+        // The embedding tensor is expected to be [batch, seq_len, hidden].
         let (_bs, seq_len, _h) = input.dims3()?;
+
+        // Section: initialize hidden state
         let mut x = input.clone();
-        for (i, b) in self.blocks.iter().enumerate() {
-            x = b.forward(&x, pos, i, cache)?;
+
+        // Section: run transformer blocks
+        // Important: blocks can be None in selective loading mode.
+        for (i_block_no, o_block_opt) in self.blocks.iter().enumerate() {
+            // Section: unwrap block or fail fast
+            // If a block is not loaded on this peer, local execution is not possible.
+            let o_block = o_block_opt.as_ref().ok_or_else(|| {
+                candle::Error::Msg("forward_input_embed: block not loaded on this peer".to_string())
+            })?;
+
+            // Section: forward one block
+            x = o_block.forward(&x, pos, i_block_no, cache)?;
         }
+
+        // Section: final stage (norm + lm_head)
         self.forward_final_from_hidden(&x, seq_len)
     }
 
     pub fn forward(&self, ids: &Tensor, pos: usize, cache: &mut Cache) -> Result<Tensor> {
+        // Section: input shape validation and token embedding
         let (_bs, seq_len) = ids.dims2()?;
         let mut x = self.wte.forward(ids)?;
-        for (i, b) in self.blocks.iter().enumerate() {
-            x = b.forward(&x, pos, i, cache)?;
+
+        // Section: transformer blocks
+        // Important: each block may be None in selective loading mode.
+        for (i_layer, o_block_opt) in self.blocks.iter().enumerate() {
+            // Important: fail fast if the block is not loaded locally
+            let o_block = o_block_opt.as_ref().ok_or_else(|| {
+                candle::Error::Msg("forward: block not loaded on this peer".to_string())
+            })?;
+
+            // Important: deterministic per-layer forward
+            x = o_block.forward(&x, pos, i_layer, cache)?;
         }
+
+        // Section: final stage (norm + lm_head) from last token position
         self.forward_final_from_hidden(&x, seq_len)
     }
 
@@ -503,7 +554,8 @@ impl Llama {
         logits.to_dtype(DType::F32)
     }
 
-    pub fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
+    pub fn load(vb: VarBuilder, cfg: &Config, o_blocks_map: &BlocksMap) -> Result<Self> {
+        // Section: load shared components (always required)
         let wte = embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
 
         let lm_head = if cfg.tie_word_embeddings {
@@ -514,13 +566,46 @@ impl Llama {
 
         let ln_f = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
 
-        let blocks = (0..cfg.num_hidden_layers)
-            .map(|i| Block::load(vb.pp(format!("model.layers.{i}")), cfg))
-            .collect::<Result<Vec<_>>>()?;
+        // Section: read routing context (best effort)
+        let s_model_name = std::env::var("MODEL_NAME").unwrap_or_else(|_| "llama".to_string());
+
+        // Section: init blocks vector (must be num_hidden_layers long)
+        let mut v_blocks: Vec<Option<Block>> = vec![None; cfg.num_hidden_layers];
+
+        // Section: selective load if blocks_map exists, otherwise full load
+        let s_self_peer_id = o_blocks_map.s_self_peer_id.trim().to_string();
+
+        for i_layer in 0..cfg.num_hidden_layers {
+            // Section: resolve route peer for this block
+            let s_peer_for_block_opt = o_blocks_map.get_peer_for_block(&s_model_name, i_layer);
+
+            // Robustness: if a route is missing, fallback to full load
+            let s_peer_for_block = match s_peer_for_block_opt {
+                Some(v) => v,
+                None => {
+                    println!("FALLBACK - ROUTE IS MISSING: {}",i_layer);
+                    for j_layer in 0..cfg.num_hidden_layers {
+                        let o_b = Block::load(vb.pp(format!("model.layers.{j_layer}")), cfg)?;
+                        v_blocks[j_layer] = Some(o_b);
+                    }
+                    break;
+                }
+            };
+
+            // Section: load only blocks assigned to self peer
+            if s_peer_for_block.trim() == s_self_peer_id {
+                println!("geladener Block: {}",i_layer);
+                let o_b = Block::load(vb.pp(format!("model.layers.{i_layer}")), cfg)?;
+                v_blocks[i_layer] = Some(o_b);
+            } else {
+                // Important: do not load this block to minimize memory usage
+                v_blocks[i_layer] = None;
+            }
+        }
 
         Ok(Self {
             wte,
-            blocks,
+            blocks: v_blocks,
             ln_f,
             lm_head,
         })

@@ -11,10 +11,11 @@
             "cargo": {
                 "args": [
                     "run",
-                    "--bin=llm"
+                    "--bin=llm_node"
                 ]
             },
-            "args": []
+            "args": [],
+            "stopOnEntry": true
         },
         {
             "name": "Debug unit tests in executable 'llm'",
@@ -23,9 +24,11 @@
             "cargo": {
                 "args": [
                     "test",
-                    "--bin=llm"
-                ]
-            }
+                    "--bin=llm_node"
+                ],
+            
+            },
+            "stopOnEntry": true
         }
     ]
 }

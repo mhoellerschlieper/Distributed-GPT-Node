@@ -18,6 +18,8 @@ use async_trait::async_trait;
 use candle::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 
+use crate::p2p_blocks_map::BlocksMap;
+
 fn debug_on() -> bool {
     matches!(std::env::var("DEBUG_MODEL"), Ok(s_val) if s_val != "0")
 }
@@ -58,7 +60,9 @@ impl CandleLlamaModel {
                 .map_err(|e| format!("safetensors mmap fehlgeschlagen: {}", e))?
         };
 
-        let model = LocalLlama::load(vb, &config).map_err(|e| format!("llama load: {}", e))?;
+        let o_blocks_map = BlocksMap::from_file("")?;
+
+        let model = LocalLlama::load(vb, &config, &o_blocks_map).map_err(|e| format!("llama load: {}", e))?;
         let cache =
             Cache::new(true, dtype, &config, &dev).map_err(|e| format!("llama cache: {}", e))?;
 
