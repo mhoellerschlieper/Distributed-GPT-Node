@@ -61,6 +61,7 @@ mod p2p_node;
 mod p2p_runtime_handle;
 mod p2p_tensor_conv;
 mod p2p_wire;
+mod device_select;
 
 use async_trait::async_trait;
 use crossterm::event::{self, Event, KeyCode};
@@ -72,11 +73,14 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 use std::time::Instant;
+use tokio::sync::Mutex;
 
 use crate::p2p_tensor_conv::{tensor_to_wire, wire_to_tensor};
 use crate::p2p_wire::RunBlockResponse;
+use crate::device_select::get_default_device;
+
+use candle::Device;
 
 // ------------------------------------------------------------
 // Section: Environment helpers
@@ -479,7 +483,6 @@ impl LmBackend for crate::models_p2p::P2pLlamaModel {
     }
 }
 
-
 /// Builds the selected backend according to ENV BACKEND.
 /// - Input: local peer id (used by P2P backend for addressing and identity)
 /// - Output: boxed backend implementing LmBackend
@@ -535,7 +538,7 @@ fn load_local_llama_from_env_config(
     o_env: &ModelEnvConfig,
     o_blocks_map: &crate::p2p_blocks_map::BlocksMap,
 ) -> Result<crate::local_llama::LocalLlama, String> {
-    let o_dev = candle::Device::Cpu;
+    let o_dev = get_default_device();
 
     let o_config = load_llama_config_from_json(&o_env.s_config)?;
 
@@ -580,8 +583,7 @@ fn build_backend(
     // Build backend using injected model (no weight load inside).
     let s_blocks_map_file =
         std::env::var("BLOCKS_MAP").unwrap_or_else(|_| "blocks_map.json".to_string());
-    let s_model_name =
-        std::env::var("MODEL_NAME").unwrap_or_else(|_| "llama".to_string());
+    let s_model_name = std::env::var("MODEL_NAME").unwrap_or_else(|_| "llama".to_string());
 
     let o_mdl = crate::models_p2p::P2pLlamaModel::new_with_local_model(
         o_local_llama_arc.clone(),
@@ -594,8 +596,6 @@ fn build_backend(
 
     Ok((o_backend, o_server_state))
 }
-
-
 
 // ------------------------------------------------------------
 // Section: Chat state
@@ -740,8 +740,8 @@ fn load_ctx_from_file(s_file: &str) -> Result<Vec<u32>, String> {
     }
 
     // Section: file read
-    let s_raw =
-        std::fs::read_to_string(s_file).map_err(|e| format!("load: lesen fehlgeschlagen: {}", e))?;
+    let s_raw = std::fs::read_to_string(s_file)
+        .map_err(|e| format!("load: lesen fehlgeschlagen: {}", e))?;
 
     // Section: parse CSV into ids
     let mut v_ids: Vec<u32> = Vec::new();
@@ -839,8 +839,6 @@ fn build_peer_hash_from_peer_id(o_peer: &PeerId) -> u64 {
     o_hasher.finish()
 }
 
-
-
 // New central function: reset only cache for peer, keep model loaded
 // History:
 // - 2026-01-03 Marcus Schlieper: initial, peer hashed cache map, reset only for peer
@@ -867,7 +865,7 @@ async fn reset_server_cache_only(
     };
 
     // Section: device selection for cache
-    let o_dev = candle::Device::Cpu;
+    let o_dev = get_default_device();
 
     // Section: parse model config to build cache correctly
     let v_cfg_bytes =
@@ -896,7 +894,7 @@ async fn reset_server_cache_only(
 /// - Robustness: uses a dummy tensor to satisfy response schema
 fn make_error_response(s_err: &str) -> Result<Vec<u8>, String> {
     // Section: build dummy tensor
-    let o_dummy = candle::Tensor::zeros((1, 1, 1), candle::DType::F32, &candle::Device::Cpu)
+    let o_dummy = candle::Tensor::zeros((1, 1, 1), candle::DType::F32, &get_default_device())
         .map_err(|e| format!("server: dummy tensor: {}", e))?;
 
     // Section: build response payload
@@ -922,7 +920,9 @@ type P2pServerStateHolder = Arc<Mutex<P2pServerStateRef>>;
 ///   - executes requested blocks sequentially using peer-specific KV cache
 ///   - encodes RunBlockResponse
 /// - Robustness: returns error response bytes on failures instead of crashing
-fn build_p2p_server_handler(o_state_holder: P2pServerStateHolder) -> crate::p2p_node::ServerHandler {
+fn build_p2p_server_handler(
+    o_state_holder: P2pServerStateHolder,
+) -> crate::p2p_node::ServerHandler {
     Arc::new(move |o_peer, v_req| {
         let o_state_holder_inner = o_state_holder.clone();
 
@@ -972,7 +972,7 @@ fn build_p2p_server_handler(o_state_holder: P2pServerStateHolder) -> crate::p2p_
                             _ => candle::DType::F32,
                         };
 
-                        let o_dev = candle::Device::Cpu;
+                        let o_dev = get_default_device();
 
                         // Parse config to allocate proper cache structure
                         let v_cfg_bytes = match std::fs::read(&s_config) {
@@ -1003,7 +1003,9 @@ fn build_p2p_server_handler(o_state_holder: P2pServerStateHolder) -> crate::p2p_
                             true, e_dtype, &o_config, &o_dev,
                         ) {
                             Ok(v) => v,
-                            Err(e) => return make_error_response(&format!("server: llama cache: {}", e)),
+                            Err(e) => {
+                                return make_error_response(&format!("server: llama cache: {}", e))
+                            }
                         };
 
                         // Important: insert cache into map
@@ -1020,7 +1022,12 @@ fn build_p2p_server_handler(o_state_holder: P2pServerStateHolder) -> crate::p2p_
                     let o_llama = o_state_ref.o_model.inner_ref();
                     match o_llama.forward_one_block(&calc_x, o_req.i_pos, i_block_no, o_cache_mut) {
                         Ok(v) => v,
-                        Err(e) => return make_error_response(&format!("server: forward_one_block: {}", e)),
+                        Err(e) => {
+                            return make_error_response(&format!(
+                                "server: forward_one_block: {}",
+                                e
+                            ))
+                        }
                     }
                 };
             }
@@ -1029,7 +1036,9 @@ fn build_p2p_server_handler(o_state_holder: P2pServerStateHolder) -> crate::p2p_
             let o_resp = RunBlockResponse {
                 o_y: match tensor_to_wire(&calc_x) {
                     Ok(v) => v,
-                    Err(e) => return make_error_response(&format!("server: tensor_to_wire: {}", e)),
+                    Err(e) => {
+                        return make_error_response(&format!("server: tensor_to_wire: {}", e))
+                    }
                 },
                 s_error: String::new(),
             };
@@ -1061,7 +1070,10 @@ fn build_clear_cache_handler(
             };
 
             // Important: operator log for debugging and audits
-            println!("build_clear_cache_handler for far peer-ID: {}", o_far_peer_id);
+            println!(
+                "build_clear_cache_handler for far peer-ID: {}",
+                o_far_peer_id
+            );
 
             // Section: reset per-peer cache only
             reset_server_cache_only(&o_state_ref, &o_far_peer_id).await

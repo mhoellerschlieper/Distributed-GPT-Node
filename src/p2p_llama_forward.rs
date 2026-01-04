@@ -96,7 +96,7 @@ pub async fn forward_input_embed_p2p(
             return Err(candle::Error::Msg("p2p forward: remote blocks ist leer".to_string()));
         }
 
-        // sende ein request fuer dieses zusammenhaengende block segment
+        // sende ein request fuer dieses zusammenhaengende Blocksegment
         o_x = crate::p2p_client_libp2p::send_blocks_run_and_wait(
             o_remote_peer_id,
             s_model_name,
@@ -139,6 +139,7 @@ pub async fn forward_p2p(
             .parse()
             .map_err(|_| candle::Error::Msg("blocks_map peer id ungueltig".to_string()))?;
 
+        // wenn der Block lokal berechnet werden soll, dann....
         if o_peer_id == o_my_peer_id {
             // local block
             o_x = o_llama.forward_one_block(&o_x, i_pos, i_block_no, o_cache)?;

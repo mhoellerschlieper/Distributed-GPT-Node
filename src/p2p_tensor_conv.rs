@@ -12,6 +12,7 @@
 // ------------------------------------------------------------
 
 use crate::p2p_wire::{WireDType, WireTensor};
+use crate::device_select::get_default_device;
 use candle::{DType, Device, Tensor};
 
 pub fn tensor_to_wire(o_x: &Tensor) -> Result<WireTensor, String> {
@@ -29,7 +30,7 @@ pub fn tensor_to_wire(o_x: &Tensor) -> Result<WireTensor, String> {
     };
 
     let o_cpu = o_x
-        .to_device(&Device::Cpu)
+        .to_device(&get_default_device())
         .map_err(|e| format!("tensor_to_wire: to_cpu: {}", e))?;
 
     let o_f32 = o_cpu
@@ -58,7 +59,7 @@ pub fn wire_to_tensor(o_w: &WireTensor) -> Result<Tensor, String> {
     }
 
     let v_f32 = cast_bytes_to_f32(&o_w.v_data)?;
-    let o_t = Tensor::new(v_f32, &Device::Cpu).map_err(|e| format!("Tensor::new: {}", e))?;
+    let o_t = Tensor::new(v_f32, &get_default_device()).map_err(|e| format!("Tensor::new: {}", e))?;
     let o_t = o_t
         .reshape(o_w.v_shape.as_slice())
         .map_err(|e| format!("reshape: {}", e))?;

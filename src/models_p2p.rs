@@ -29,6 +29,7 @@ use std::sync::Arc;
 use crate::local_llama::{Cache, Config, LlamaConfig, LocalLlama};
 use crate::p2p_blocks_map::BlocksMap;
 use crate::p2p_llama_forward;
+use crate::device_select::get_default_device;
 
 fn debug_on() -> bool {
     matches!(std::env::var("DEBUG_MODEL"), Ok(s_val) if s_val != "0")
@@ -88,7 +89,7 @@ impl P2pLlamaModel {
             _ => DType::F32,
         };
 
-        let o_dev = Device::Cpu;
+        let o_dev = get_default_device();
 
         let v_cfg_bytes = std::fs::read(&s_config_json)
             .map_err(|e| format!("config json lesen fehlgeschlagen: {}", e))?;
