@@ -76,6 +76,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use std::time::Instant;
 
 use crate::p2p_tensor_conv::{tensor_to_wire, wire_to_tensor};
 use crate::p2p_wire::RunBlockResponse;
@@ -1402,6 +1403,12 @@ async fn chat_loop(
         let mut s_printed = String::new();
         let mut printed_any = false;
 
+        // Metrics: measure per assistant response generation
+        // - i_gen_tokens: number of tokens generated in this response
+        // - o_t0: start time
+        let mut i_gen_tokens: usize = 0;
+        let o_t0 = Instant::now();
+
         for _step in 0..env_usize("MAX_NEW", 64) {
             // Section: user abort via Space key
             if is_abort_space_pressed()? {
@@ -1429,6 +1436,9 @@ async fn chat_loop(
             // Important: append token to context and pending buffer
             ctx_ids.push(next_idx);
             pending.push(next_idx);
+
+            // Metrics: count generated tokens (one per loop iteration)
+            i_gen_tokens += 1;
 
             // Section: streaming output by delta decoding
             let s_all = tok.decode(&pending, true).unwrap_or_default();
@@ -1465,6 +1475,22 @@ async fn chat_loop(
                 }
             }
         }
+
+        // Metrics: finalize and print after generation finished
+        let d_elapsed_s: f64 = o_t0.elapsed().as_secs_f64();
+        let d_tps: f64 = if d_elapsed_s > 0.0 {
+            (i_gen_tokens as f64) / d_elapsed_s
+        } else {
+            0.0
+        };
+
+        println!("");
+        // Print metrics in a compact, operator friendly block
+        println!("------------------------------------------------------------");
+        println!("metrics token_count: {}", i_gen_tokens);
+        println!("metrics tokens_per_sec: {:.3}", d_tps);
+        println!("metrics total_duration_sec: {:.3}", d_elapsed_s);
+        println!("------------------------------------------------------------");
 
         if !printed_any {
             println!("[kein token erzeugt]");

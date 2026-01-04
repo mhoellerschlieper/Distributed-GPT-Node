@@ -32,8 +32,8 @@ use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, oneshot, Mutex};
 use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 // ---------------- Types ----------------
 
@@ -52,9 +52,7 @@ pub type ServerHandler = Arc<
 // New: clear cache handler callback for inbound clear cache messages.
 // This callback is invoked with the far peer id that requested the cache clear.
 pub type ClearCacheHandler = Arc<
-    dyn Fn(
-            PeerId,
-        ) -> Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+    dyn Fn(PeerId) -> Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
         + Send
         + Sync,
 >;
@@ -125,8 +123,7 @@ fn encode_clear_cache_request(o_from_peer: &PeerId) -> Result<Vec<u8>, String> {
         s_from_peer_id: o_from_peer.to_string(),
     };
 
-    bincode::serialize(&o_msg)
-        .map_err(|_| "clear cache: request encode fehlgeschlagen".to_string())
+    bincode::serialize(&o_msg).map_err(|_| "clear cache: request encode fehlgeschlagen".to_string())
 }
 
 fn encode_clear_cache_response_ok() -> Vec<u8> {
@@ -296,6 +293,7 @@ pub fn spawn_swarm_task(
         let mut map_pending: HashMap<RequestIdType, oneshot::Sender<Result<Vec<u8>, String>>> =
             HashMap::new();
 
+        let mut bFirstTime = true;
         loop {
             tokio::select! {
                 o_ctl_opt = o_ctl_rx.recv() => {
@@ -362,7 +360,7 @@ pub fn spawn_swarm_task(
                                     let _ = o_swarm.behaviour_mut().rr.send_request(&o_peer, v_req.clone());
                                 }
 
-                                
+
                             }
                         }
                     } else {
@@ -415,12 +413,15 @@ pub fn spawn_swarm_task(
                             // Hinweis: Hier wird bewusst der ClearCacheHandler wiederverwendet, da dieser
                             // die korrekte serverseitige Reset Logik kapselt und keine zusaetzlichen
                             // Abhaengigkeiten (StateRef) in p2p_node.rs eingefuehrt werden muessen.
-                            match (o_clear_cache_handler)(peer_id).await {
-                                Ok(()) => {
-                                    println!("connection established: cache reset ok peer={}", peer_id);
-                                }
-                                Err(e) => {
-                                    println!("connection established: cache reset failed peer={} err={}", peer_id, e);
+                            if (bFirstTime){
+                                match (o_clear_cache_handler)(peer_id).await {
+                                    Ok(()) => {
+                                        bFirstTime= false;
+                                        println!("connection established: cache reset ok peer={}", peer_id);
+                                    }
+                                    Err(e) => {
+                                        println!("connection established: cache reset failed peer={} err={}", peer_id, e);
+                                    }
                                 }
                             }
                         }
