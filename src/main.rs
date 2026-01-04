@@ -51,7 +51,7 @@ mod local_llama;
 mod model;
 
 mod model_inspect;
-mod models_candle;
+// mod models_candle;
 mod tokenizer;
 
 mod models_p2p;
@@ -468,20 +468,6 @@ trait LmBackend: Send {
 }
 
 #[async_trait]
-impl LmBackend for models_candle::CandleLlamaModel {
-    /// Adapter for Candle backend.
-    /// - Delegates to CandleLlamaModel::forward_tokens
-    async fn forward_tokens(&mut self, ids: &[u32]) -> Result<Vec<f32>, String> {
-        models_candle::CandleLlamaModel::forward_tokens(self, ids)
-    }
-
-    /// Adapter for Candle backend vocabulary size.
-    fn vocab_size(&self) -> usize {
-        models_candle::CandleLlamaModel::vocab_size(self)
-    }
-}
-
-#[async_trait]
 impl LmBackend for crate::models_p2p::P2pLlamaModel {
     /// Adapter for P2P backend.
     /// - Delegates to forward_tokens_async
@@ -495,6 +481,7 @@ impl LmBackend for crate::models_p2p::P2pLlamaModel {
     }
 }
 
+
 /// Builds the selected backend according to ENV BACKEND.
 /// - Input: local peer id (used by P2P backend for addressing and identity)
 /// - Output: boxed backend implementing LmBackend
@@ -505,17 +492,25 @@ impl LmBackend for crate::models_p2p::P2pLlamaModel {
 /// - P2P additional ENV:
 ///   - BLOCKS_MAP, MODEL_NAME
 /// - Robustness: unknown BACKEND values fall back to local backend
-fn build_backend(o_peer_id: PeerId) -> Result<Box<dyn LmBackend>, String> {
-    // Section: mandatory paths
+// ------------------------------------------------------------
+// Section: Backend trait and backend build (refactored)
+// ------------------------------------------------------------
+// New: shared config struct for unified construction
+struct ModelEnvConfig {
+    s_weights: String,
+    s_config: String,
+    e_dtype: candle::DType,
+}
+
+fn read_model_env_config() -> Result<ModelEnvConfig, String> {
     let s_weights =
         std::env::var("LLAMA_WEIGHTS").map_err(|_| "Env LLAMA_WEIGHTS fehlt".to_string())?;
     let s_config =
         std::env::var("LLAMA_CONFIG").map_err(|_| "Env LLAMA_CONFIG fehlt".to_string())?;
-    let s_backend = std::env::var("BACKEND").unwrap_or_else(|_| "local".to_string());
 
-    // Section: dtype selection with safe default
-    let dt = match std::env::var("LLAMA_DTYPE")
+    let e_dtype = match std::env::var("LLAMA_DTYPE")
         .unwrap_or_else(|_| "f32".to_string())
+        .to_lowercase()
         .as_str()
     {
         "f16" => candle::DType::F16,
@@ -523,43 +518,86 @@ fn build_backend(o_peer_id: PeerId) -> Result<Box<dyn LmBackend>, String> {
         _ => candle::DType::F32,
     };
 
-    // Important: explicit runtime log line for operator diagnostics
-    println!("RUNNING: {}", s_backend);
+    Ok(ModelEnvConfig {
+        s_weights,
+        s_config,
+        e_dtype,
+    })
+}
 
-    // Section: backend selection
-    let o_backend: Box<dyn LmBackend> = match s_backend.as_str() {
-        "local" | "candle" => {
-            // Local candle inference
-            let o_mdl =
-                models_candle::CandleLlamaModel::from_safetensors(&s_weights, &s_config, dt)?;
-            Box::new(o_mdl)
-        }
-        "p2p" => {
-            // P2P inference requires blocks map and model name
-            let s_blocks_map_file =
-                std::env::var("BLOCKS_MAP").unwrap_or_else(|_| "blocks_map.json".to_string());
-            let s_model_name = std::env::var("MODEL_NAME").unwrap_or_else(|_| "llama".to_string());
+fn load_llama_config_from_json(s_config: &str) -> Result<crate::local_llama::Config, String> {
+    let v_cfg_bytes =
+        std::fs::read(s_config).map_err(|e| format!("config json lesen fehlgeschlagen: {}", e))?;
+    let o_cfg_raw: crate::local_llama::LlamaConfig =
+        serde_json::from_slice(&v_cfg_bytes).map_err(|e| format!("config json parse: {}", e))?;
+    Ok(o_cfg_raw.into_config(false))
+}
 
-            let o_mdl = crate::models_p2p::P2pLlamaModel::from_safetensors(
-                &s_weights,
-                &s_config,
-                dt,
-                &s_blocks_map_file,
-                &s_model_name,
-                o_peer_id,
-            )?;
-            Box::new(o_mdl)
-        }
-        _ => {
-            // Fallback: local candle inference for unknown backend setting
-            let o_mdl =
-                models_candle::CandleLlamaModel::from_safetensors(&s_weights, &s_config, dt)?;
-            Box::new(o_mdl)
-        }
+fn load_local_llama_from_env_config(
+    o_env: &ModelEnvConfig,
+    o_blocks_map: &crate::p2p_blocks_map::BlocksMap,
+) -> Result<crate::local_llama::LocalLlama, String> {
+    let o_dev = candle::Device::Cpu;
+
+    let o_config = load_llama_config_from_json(&o_env.s_config)?;
+
+    let v_weight_files = crate::model_inspect::build_weight_files(&o_env.s_weights)?;
+    let o_vb = unsafe {
+        candle_nn::VarBuilder::from_mmaped_safetensors(&v_weight_files, o_env.e_dtype, &o_dev)
+            .map_err(|e| format!("safetensors mmap fehlgeschlagen: {}", e))?
     };
 
-    Ok(o_backend)
+    crate::local_llama::LocalLlama::load(o_vb, &o_config, o_blocks_map)
+        .map_err(|e| format!("llama load: {}", e))
 }
+
+// ------------------------------------------------------------
+// Description
+// Adjust build_backend to pass the already loaded Arc<LocalLlama> into P2pLlamaModel,
+// avoiding double weight loading.
+//
+// Author
+// Marcus Schlieper, ExpChat.ai
+//
+// History
+// - 2026-01-04 Marcus Schlieper: pass injected shared LocalLlama into P2pLlamaModel
+// ------------------------------------------------------------
+
+fn build_backend(
+    o_peer_id: libp2p::PeerId,
+    o_blocks_map: &crate::p2p_blocks_map::BlocksMap,
+) -> Result<(Box<dyn LmBackend>, P2pServerStateRef), String> {
+    let o_env = read_model_env_config()?;
+
+    // Load LocalLlama once.
+    let o_local_llama = load_local_llama_from_env_config(&o_env, o_blocks_map)?;
+    let o_local_llama_arc: Arc<crate::local_llama::LocalLlama> = Arc::new(o_local_llama);
+
+    // Build server state from the same LocalLlama instance.
+    let o_server_state: P2pServerStateRef = Arc::new(P2pServerState {
+        o_model: o_local_llama_arc.clone(),
+        o_cache_by_peer_hash: Arc::new(Mutex::new(HashMap::new())),
+    });
+
+    // Build backend using injected model (no weight load inside).
+    let s_blocks_map_file =
+        std::env::var("BLOCKS_MAP").unwrap_or_else(|_| "blocks_map.json".to_string());
+    let s_model_name =
+        std::env::var("MODEL_NAME").unwrap_or_else(|_| "llama".to_string());
+
+    let o_mdl = crate::models_p2p::P2pLlamaModel::new_with_local_model(
+        o_local_llama_arc.clone(),
+        &s_blocks_map_file,
+        &s_model_name,
+        o_peer_id,
+    )?;
+
+    let o_backend: Box<dyn LmBackend> = Box::new(o_mdl);
+
+    Ok((o_backend, o_server_state))
+}
+
+
 
 // ------------------------------------------------------------
 // Section: Chat state
@@ -803,55 +841,7 @@ fn build_peer_hash_from_peer_id(o_peer: &PeerId) -> u64 {
     o_hasher.finish()
 }
 
-/// Builds server state from environment configuration.
-/// - Required ENV: LLAMA_WEIGHTS, LLAMA_CONFIG
-/// - Optional ENV: LLAMA_DTYPE
-/// - Output: shared P2pServerStateRef with empty per-peer cache map
-/// - Important: loads model once and shares it across requests
-fn build_server_state_from_env(o_blocks_map: &crate::p2p_blocks_map::BlocksMap) -> Result<P2pServerStateRef, String> {
-    // Section: read mandatory config paths
-    let s_weights =
-        std::env::var("LLAMA_WEIGHTS").map_err(|_| "LLAMA_WEIGHTS fehlt".to_string())?;
-    let s_config = std::env::var("LLAMA_CONFIG").map_err(|_| "LLAMA_CONFIG fehlt".to_string())?;
 
-    // Section: dtype selection
-    let e_dtype = match std::env::var("LLAMA_DTYPE")
-        .unwrap_or_else(|_| "f32".to_string())
-        .as_str()
-    {
-        "f16" => candle::DType::F16,
-        "bf16" => candle::DType::BF16,
-        _ => candle::DType::F32,
-    };
-
-    // Section: device selection
-    // Important: explicit CPU device for server handler in this implementation
-    let o_dev = candle::Device::Cpu;
-
-    // Section: load and parse config JSON
-    let v_cfg_bytes =
-        std::fs::read(&s_config).map_err(|e| format!("config json lesen fehlgeschlagen: {}", e))?;
-    let o_cfg_raw: crate::local_llama::LlamaConfig =
-        serde_json::from_slice(&v_cfg_bytes).map_err(|e| format!("config json parse: {}", e))?;
-    let o_config = o_cfg_raw.into_config(false);
-
-    // Section: build weight file list and mmap safetensors
-    let v_weight_files = crate::model_inspect::build_weight_files(&s_weights)?;
-    let o_vb = unsafe {
-        // Important: mmap speeds up loading but uses unsafe API; errors are handled explicitly
-        candle_nn::VarBuilder::from_mmaped_safetensors(&v_weight_files, e_dtype, &o_dev)
-            .map_err(|e| format!("safetensors mmap fehlgeschlagen: {}", e))?
-    };
-
-    // Section: load model weights and initialize LocalLlama
-    let o_model = crate::local_llama::LocalLlama::load(o_vb, &o_config, o_blocks_map)
-        .map_err(|e| format!("llama load: {}", e))?;
-
-    Ok(Arc::new(P2pServerState {
-        o_model: Arc::new(o_model),
-        o_cache_by_peer_hash: Arc::new(Mutex::new(HashMap::new())),
-    }))
-}
 
 // New central function: reset only cache for peer, keep model loaded
 // History:
@@ -1499,43 +1489,42 @@ async fn chat_loop(
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
-    // Section: configuration paths
     let s_blocks_map_file =
         std::env::var("BLOCKS_MAP").unwrap_or_else(|_| "blocks_map.json".to_string());
     let s_peer_key_file =
         std::env::var("PEER_KEY_FILE").unwrap_or_else(|_| "peer_key.bin".to_string());
 
-    // Section: blocks_map load and apply settings
+    println!("1");
     let o_blocks_map = crate::p2p_blocks_map::BlocksMap::from_file(&s_blocks_map_file)?;
     apply_blocks_map_to_env(&o_blocks_map)?;
+    println!("2");
 
-    // Section: read P2P port after applying blocks_map defaults
     let i_p2p_port = env_u16("P2P_PORT", 4001);
 
-    // Section: identity initialization
     let (o_keypair, o_peer_id, _o_map) =
         crate::p2p_identity::init_peer_identity(&s_blocks_map_file, &s_peer_key_file)?;
     println!("peer id: {}", o_peer_id);
+    println!("3");
 
-    // Section: build and spawn P2P runtime
     let (o_p2p_rt, o_swarm, o_rx, o_ctl_rx) =
         crate::p2p_node::build_runtime(i_p2p_port, o_keypair)?;
     let o_connected_peers = o_p2p_rt.o_connected_peers.clone();
+    println!("4");
 
-    // Section: server state holder (indirection supports runtime clear behavior)
-    let o_server_state = build_server_state_from_env(&o_blocks_map)?;
+    // New: build both backend and server state in one call
+    let (mut o_backend, o_server_state) = build_backend(o_peer_id, &o_blocks_map)?;
     let o_state_holder: P2pServerStateHolder = Arc::new(Mutex::new(o_server_state));
+    println!("5");
 
-    // Section: build server handler and clear-cache handler
     let o_server_handler: crate::p2p_node::ServerHandler =
         build_p2p_server_handler(o_state_holder.clone());
+    println!("6");
 
-    // Important: publish runtime handle globally for other modules if required
     crate::p2p_runtime_handle::set_p2p_runtime(o_p2p_rt.clone())?;
 
     let o_clear_cache_handler = build_clear_cache_handler(o_state_holder.clone());
+    println!("7");
 
-    // Section: spawn swarm task which owns the network event loop
     crate::p2p_node::spawn_swarm_task(
         o_swarm,
         o_rx,
@@ -1546,30 +1535,30 @@ async fn main() -> Result<(), String> {
     );
     println!("p2p peer id: {}", o_p2p_rt.o_self_peer_id);
     println!("p2p listen tcp port: {}", i_p2p_port);
+    println!("8");
 
-    // Section: auto connect peers if backend is p2p
-    let o_blocks_map = crate::p2p_blocks_map::BlocksMap::from_file(&s_blocks_map_file)?;
+    // NOTE: keep blocks_map reload if needed, otherwise reuse o_blocks_map
+    let o_blocks_map2 = crate::p2p_blocks_map::BlocksMap::from_file(&s_blocks_map_file)?;
     if std::env::var("BACKEND").unwrap_or_else(|_| "local".to_string()) == "p2p" {
-        auto_connect_route_peers(&o_p2p_rt, &o_blocks_map).await?;
+        auto_connect_route_peers(&o_p2p_rt, &o_blocks_map2).await?;
     }
+    println!("9");
 
-    // Section: tokenizer initialization
     let s_tok_json = std::env::var("TOKENIZER_JSON")
         .map_err(|_| "Bitte TOKENIZER_JSON auf tokenizer.json setzen".to_string())?;
     let o_tok = tokenizer::load_tokenizer_from_json_force(&s_tok_json)
         .map_err(|e| format!("Tokenizer Load Fehler: {}", e))?;
+    println!("10");
 
-    // Section: backend construction
-    let mut o_backend = build_backend(o_peer_id)?;
     println!("Vokabular (Backend): {}", o_backend.vocab_size());
 
-    // Section: detect prompt template
     let e_fmt = detect_chat_template(&o_tok);
+    println!("11");
 
-    // Section: start chat loop with p2p runtime enabled
     let o_p2p_rt_opt = Some(o_p2p_rt.clone());
 
-    let mut ctx_ids: Vec<u32> = Vec::new();
+    let ctx_ids: Vec<u32> = Vec::new();
+    println!("12");
 
     chat_loop(
         o_tok,

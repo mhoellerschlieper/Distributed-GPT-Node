@@ -5,7 +5,7 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Debug executable 'llm'",
+            "name": "Debug executable 'llm-node'",
             "type": "lldb",
             "request": "launch",
             "cargo": {
@@ -24,7 +24,7 @@
             "cargo": {
                 "args": [
                     "test",
-                    "--bin=llm_node"
+                    "--bin=llm"
                 ],
             
             },
