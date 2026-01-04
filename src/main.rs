@@ -48,10 +48,7 @@
 // and P2P functionality (wire format, codec, node runtime, blocks map, identity).
 // ------------------------------------------------------------
 mod local_llama;
-mod model;
-
 mod model_inspect;
-// mod models_candle;
 mod tokenizer;
 
 mod models_p2p;
