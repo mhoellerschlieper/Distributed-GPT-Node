@@ -1,6 +1,6 @@
 # Distributed-GPT-Node
 
-LLM_Node is a Rust project for **local and distributed Llama inference** built on **Candle**. It is designed as an **LLM node**: one node can run a model fully locally, or—via routing with a `BlocksMap`—load only selected Transformer layers and execute the remaining layers through a **P2P network (libp2p)**.
+Distributed-GPT-Node is a Rust project for **local and distributed Llama inference** built on **Candle**. It is designed as an **LLM node**: one node can run a model fully locally, or—via routing with a `BlocksMap`—load only selected Transformer layers and execute the remaining layers through a **P2P network (libp2p)**.
 
 The focus is on practical inference, an interactive **CLI chat** with **token streaming**, **KV-cache optimizations**, and **distributed block forwarding** (layer sharding).
 
