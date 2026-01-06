@@ -16,7 +16,7 @@
 // - 2026-01-04 Marcus Schlieper: fix Result signature (Result<Device>)
 // -----------------------------------------------------------
 use candle::Device;
-pub const USE_CUDA: bool = true;
+pub const USE_CUDA: bool = false;
 pub const I_CUDA_DEVICE_INDEX: usize = 0;
 
 pub fn get_default_device() -> candle::Device {
