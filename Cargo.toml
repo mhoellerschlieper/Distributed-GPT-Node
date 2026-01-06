@@ -6,7 +6,7 @@ authors     = ["Marcus Schlieper <mschlieper@ylook.de>"]
 
 
 [dependencies]
-# candle = { git = "https://github.com/huggingface/candle", package = "candle-core", default-features = false }
+# cuda-12-6-0
 candle = { git = "https://github.com/huggingface/candle", package = "candle-core", default-features = false, features = ["cuda"] }
 candle_nn = { git = "https://github.com/huggingface/candle", package = "candle-nn", default-features = false, features = ["cuda"] }
 candle_transformers = { git = "https://github.com/huggingface/candle", package = "candle-transformers", default-features = false, features = ["cuda"] }
@@ -43,6 +43,8 @@ base64 = "0.22"
 axum = { version = "0.7.9", features = ["ws"] }
 tower-http = { version = "0.6", features = ["cors"] }
 uuid = { version = "1", features = ["v4"] }
+
+rayon ="1.2"
 
 
 

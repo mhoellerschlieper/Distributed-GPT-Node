@@ -33,6 +33,7 @@ use candle::{DType, Device, IndexOp, Result, Tensor};
 use candle_nn::{embedding, Embedding, Module, VarBuilder};
 use candle_transformers::utils;
 use std::collections::HashMap;
+use rayon::prelude::*;
 
 pub const DEFAULT_MAX_SEQ_LEN: usize = 4096;
 
@@ -506,29 +507,68 @@ impl CausalSelfAttention {
             return Err(candle::Error::Msg("attn: hidden dim mismatch".to_string()));
         }
 
-        let o_q = self.q_proj.forward(x)?;
-        let o_k = self.k_proj.forward(x)?;
-        let o_v = self.v_proj.forward(x)?;
+        // Parallel section:
+        // 1) Compute q_proj, k_proj, v_proj in parallel (independent GEMMs).
+        // 2) Post process q/k/v in parallel (reshape/transpose/contiguous), and apply RoPE for q/k.
+        // Notes:
+        // - This can improve CPU throughput if the tensor backend is not already saturating cores.
+        // - If the backend uses its own threadpool (e.g., BLAS), oversubscription is possible.
+        // - Errors are propagated deterministically via Result returns from each closure.
+        let (o_q_res, (o_k_res, o_v_res)) = rayon::join(
+            || self.q_proj.forward(x),
+            || {
+                rayon::join(
+                    || self.k_proj.forward(x),
+                    || self.v_proj.forward(x),
+                )
+            },
+        );
 
-        let o_q = o_q
-            .reshape((i_bs, i_seq_len, self.num_attention_heads, self.head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?;
+        // Safe error propagation.
+        let o_q_raw = o_q_res?;
+        let o_k_raw = o_k_res?;
+        let o_v_raw = o_v_res?;
 
-        let o_k = o_k
-            .reshape((i_bs, i_seq_len, self.num_key_value_heads, self.head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?;
+        // Parallel post processing:
+        // - q: reshape -> transpose -> contiguous -> rope
+        // - k: reshape -> transpose -> contiguous -> rope
+        // - v: reshape -> transpose -> contiguous
+        let (o_q_res2, (o_k_res2, o_v_res2)) = rayon::join(
+            || -> Result<Tensor> {
+                let o_q = o_q_raw
+                    .reshape((i_bs, i_seq_len, self.num_attention_heads, self.head_dim))?
+                    .transpose(1, 2)?
+                    .contiguous()?;
+                let o_q = self.apply_rotary_emb(&o_q, index_pos, cache)?;
+                Ok(o_q)
+            },
+            || {
+                rayon::join(
+                    || -> Result<Tensor> {
+                        let o_k = o_k_raw
+                            .reshape((i_bs, i_seq_len, self.num_key_value_heads, self.head_dim))?
+                            .transpose(1, 2)?
+                            .contiguous()?;
+                        let o_k = self.apply_rotary_emb(&o_k, index_pos, cache)?;
+                        Ok(o_k)
+                    },
+                    || -> Result<Tensor> {
+                        let o_v = o_v_raw
+                            .reshape((i_bs, i_seq_len, self.num_key_value_heads, self.head_dim))?
+                            .transpose(1, 2)?
+                            .contiguous()?;
+                        Ok(o_v)
+                    },
+                )
+            },
+        );
 
-        let o_v = o_v
-            .reshape((i_bs, i_seq_len, self.num_key_value_heads, self.head_dim))?
-            .transpose(1, 2)?
-            .contiguous()?;
+        // Safe error propagation for post processing.
+        let o_q = o_q_res2?;
+        let o_k = o_k_res2?;
+        let o_v = o_v_res2?;
 
-        let o_q = self.apply_rotary_emb(&o_q, index_pos, cache)?;
-        let o_k = self.apply_rotary_emb(&o_k, index_pos, cache)?;
-
-        // KV cache management (paged)
+        // Remaining code stays unchanged...
         let mut o_k_full = o_k;
         let mut o_v_full = o_v;
 
@@ -549,16 +589,12 @@ impl CausalSelfAttention {
                 i_new_total,
             )?;
 
-            // Append each token position from current seq; in prefill this is seq_len > 1.
-            // For seq_len == 1 typical decode cost is constant per layer.
             for i_tok in 0..i_seq_len {
                 let o_k_tok = o_k_full.narrow(2, i_tok, 1)?;
                 let o_v_tok = o_v_full.narrow(2, i_tok, 1)?;
                 o_paged.append_token(&o_k_tok, &o_v_tok)?;
             }
 
-            // Materialize prefix for attention. This is O(n) per step but avoids O(n) per layer per token cat.
-            // Further optimization uses flash attention which can stream, but remains backend dependent.
             let (o_k_mat, o_v_mat) = o_paged.materialize_prefix(o_paged.tokens_len())?;
             o_k_full = o_k_mat;
             o_v_full = o_v_mat;
@@ -567,44 +603,24 @@ impl CausalSelfAttention {
         let o_k_full = self.expand_kv_for_gqa(o_k_full)?;
         let o_v_full = self.expand_kv_for_gqa(o_v_full)?;
 
-        // Mixed precision: attention scores in F32, value projection in model dtype.
         let dt_model = o_q.dtype();
         let o_qf = o_q.to_dtype(DType::F32)?;
         let o_kf = o_k_full.to_dtype(DType::F32)?;
         let o_vf = o_v_full.to_dtype(DType::F32)?;
 
-        // Massnahme 5: explicit batched matmul with last two dims
-        // Shapes: q [bs, h, q, d], k [bs, h, k, d] -> k_t [bs, h, d, k]
         let o_k_t = o_kf.transpose(2, 3)?.contiguous()?;
         let o_scores = (o_qf.matmul(&o_k_t)? / (self.head_dim as f64).sqrt())?;
 
-        // Massnahme 2: flash attention path if configured and if prompt (seq_len > 1) benefits.
-        // Candle flash attention availability differs; thus safe fallback is always present.
-        // For decode seq_len == 1, this code remains efficient; for prefill seq_len > 1, flash may be used.
-        let o_probs = if self.use_flash_attn {
-            // Conservative: still compute masked softmax here as portable fallback.
-            // If a dedicated flash kernel exists in the build, it can be inserted here.
-            if i_seq_len > 1 {
-                let o_add_mask = cache.neg_inf_additive_mask(o_scores.dims4()?.2, DType::F32)?;
-                let o_add_mask = o_add_mask.broadcast_as(o_scores.shape().dims())?;
-                let o_scores_masked = (o_scores + o_add_mask)?;
-                candle_nn::ops::softmax_last_dim(&o_scores_masked)?
-            } else {
-                candle_nn::ops::softmax_last_dim(&o_scores)?
-            }
+        let o_probs = if i_seq_len > 1 {
+            let o_add_mask = cache.neg_inf_additive_mask(o_scores.dims4()?.2, DType::F32)?;
+            let o_add_mask = o_add_mask.broadcast_as(o_scores.shape().dims())?;
+            let o_scores_masked = (o_scores + o_add_mask)?;
+            candle_nn::ops::softmax_last_dim(&o_scores_masked)?
         } else {
-            if i_seq_len > 1 {
-                let o_add_mask = cache.neg_inf_additive_mask(o_scores.dims4()?.2, DType::F32)?;
-                let o_add_mask = o_add_mask.broadcast_as(o_scores.shape().dims())?;
-                let o_scores_masked = (o_scores + o_add_mask)?;
-                candle_nn::ops::softmax_last_dim(&o_scores_masked)?
-            } else {
-                candle_nn::ops::softmax_last_dim(&o_scores)?
-            }
+            candle_nn::ops::softmax_last_dim(&o_scores)?
         };
 
         let o_y = o_probs.matmul(&o_vf)?.to_dtype(dt_model)?;
-
         let o_y = o_y.transpose(1, 2)?.reshape(&[i_bs, i_seq_len, i_hidden])?;
         self.o_proj.forward(&o_y)
     }
@@ -640,8 +656,21 @@ struct Mlp {
 
 impl Mlp {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let x = (candle_nn::ops::silu(&self.fc1.forward(x)?)? * self.fc2.forward(x)?)?;
-        self.out.forward(&x)
+        // Parallel section:
+        // - fc1.forward(x) and fc2.forward(x) are independent GEMMs.
+        // - Safe error propagation via Result return in closures.
+        // - Post combine: silu(gate) * up, then down_proj.
+        let (o_gate_res, o_up_res) = rayon::join(
+            || self.fc1.forward(x),
+            || self.fc2.forward(x),
+        );
+
+        let o_gate = o_gate_res?;
+        let o_up = o_up_res?;
+
+        let o_gate_act = candle_nn::ops::silu(&o_gate)?;
+        let o_mul = (o_gate_act * o_up)?;
+        self.out.forward(&o_mul)
     }
 
     fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
